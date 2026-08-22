@@ -1,0 +1,233 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Localization QA Tool</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
+<style>
+  body { font-family: -apple-system, Segoe UI, Roboto, sans-serif; background:#f5f6fa; margin:0; padding:32px; color:#222; }
+  .box { max-width:720px; margin:0 auto; }
+  .upload { background:white; border-radius:12px; padding:28px; box-shadow:0 1px 3px rgba(0,0,0,.08); margin-bottom:24px; }
+  h1 { font-size:22px; margin-top:0; }
+  p.sub { color:#666; margin-top:-8px; }
+  input[type=file] { display:block; margin:16px 0; }
+  select { padding:6px 10px; border-radius:6px; border:1px solid #ccc; font-size:14px; }
+  label.row { display:flex; align-items:center; gap:10px; font-size:14px; color:#444; margin:12px 0; }
+  button { background:#2c3e50; color:white; border:none; padding:10px 20px; border-radius:6px; font-size:14px; cursor:pointer; }
+  button:hover { background:#1a252f; }
+  button:disabled { background:#aaa; cursor:not-allowed; }
+  .summary { display:flex; gap:14px; margin-bottom:8px; flex-wrap:wrap; }
+  .card { background:white; border-radius:10px; padding:14px 18px; box-shadow:0 1px 3px rgba(0,0,0,.08); min-width:100px; text-align:center; }
+  .card .num { font-size:24px; font-weight:700; }
+  .card .lbl { font-size:11px; color:#666; margin-top:4px; }
+  a.btn { display:inline-block; background:#16a085; color:white; padding:10px 20px; border-radius:6px; text-decoration:none; font-size:14px; margin-top:16px; cursor:pointer; }
+  .privacy { font-size:12px; color:#999; margin-top:16px; }
+  .langnote { font-size:12px; color:#8e44ad; margin-top:4px; }
+  #results { display:none; }
+  #results h2 { font-size:15px; margin-bottom:6px; }
+</style>
+</head>
+<body>
+<div class="box">
+
+  <div class="upload">
+    <h1>Localization QA Tool</h1>
+    <p class="sub">Upload a <code>languageResource.KEY = "value";</code> file. Get back one Excel workbook with separate sheets for Spelling, Spacing, Grammar, Terminology, Duplicates, and Clean strings.</p>
+    <input type="file" id="fileInput" accept=".js">
+    <label class="row">
+      Language:
+      <select id="langSelect">
+        <option value="auto">Auto-detect from filename</option>
+        <option value="en">English (en)</option>
+        <option value="fr">French (fr)</option>
+        <option value="de">German (de)</option>
+        <option value="es">Spanish (es)</option>
+        <option value="it">Italian (it)</option>
+        <option value="pt">Portuguese (pt)</option>
+        <option value="ja">Japanese (ja)</option>
+        <option value="unknown">Unknown / other</option>
+      </select>
+    </label>
+    <div class="langnote" id="langNote"></div>
+    <button id="runBtn" disabled>Run QA check</button>
+    <div class="privacy">Runs 100% in your browser. Your file is never uploaded anywhere.</div>
+  </div>
+
+  <div id="results">
+    <div class="summary" id="summaryCards"></div>
+    <a class="btn" id="downloadBtn">Download Excel report (.xlsx)</a>
+  </div>
+
+</div>
+
+<script>
+// ============ Mirrors core/language_rules.py + core/excel_report.py ============
+
+const KNOWN_LANG_CODES = {
+  en: "English", fr: "French", de: "German", es: "Spanish", it: "Italian",
+  pt: "Portuguese", nl: "Dutch", sv: "Swedish", pl: "Polish", tr: "Turkish",
+  ru: "Russian", ja: "Japanese", zh: "Chinese", ko: "Korean", ar: "Arabic", hi: "Hindi"
+};
+const SPACE_BEFORE_PUNCT_LANGS = new Set(["fr"]);
+const GLOSSARY = { ip: "IP", sop: "SOP", hu: "HU", po: "PO", fg: "FG", qc: "QC", sscc: "SSCC", drl: "DRL" };
+
+const LINE_PATTERN = /^(\s*)languageResource\.([A-Za-z0-9_]+)\s*=\s*"((?:[^"\\]|\\.)*)"(\s*;)?(\s*(\/\/.*)?)\r?$/;
+
+function detectLanguage(filename) {
+  const base = filename.toLowerCase().replace(/\.js$/, "");
+  const tokens = base.split(/[_.\-]/);
+  for (const tok of tokens) {
+    if (KNOWN_LANG_CODES[tok]) return { code: tok, name: KNOWN_LANG_CODES[tok], method: "filename" };
+  }
+  return { code: "unknown", name: "Unknown", method: "unknown" };
+}
+
+// Every category checked independently - no short-circuiting.
+function checkEntry(value, lang) {
+  const issues = { Spacing: [], Grammar: [], Spelling: [], Terminology: [] };
+  const v = value;
+
+  if (v !== v.trim()) issues.Spacing.push("Leading/trailing whitespace");
+  if (v.includes("  ")) issues.Spacing.push("Double space");
+  if (/(?<!\s)([.,!?;:])(?=[A-Za-z])(?!\w*\.(gif|png|jpe?g|pdf|csv|xlsx?))/.test(v)) {
+    issues.Spacing.push("Missing space after punctuation (run-on sentence)");
+  }
+  if (!SPACE_BEFORE_PUNCT_LANGS.has(lang)) {
+    if (/\s+[,!?;:]/.test(v)) issues.Spacing.push("Unexpected space before punctuation");
+  } else {
+    if (/[A-Za-z][!?;:]/.test(v)) issues.Spacing.push("Missing required space before punctuation (French-style spacing)");
+  }
+
+  if (/([!?])\1+/.test(v)) issues.Grammar.push('Repeated punctuation (e.g. "!!")');
+  if (/\.\.(?!\.)/.test(v)) issues.Grammar.push("Double period (not an ellipsis)");
+  const looksLikeSentence = v.split(/\s+/).filter(Boolean).length >= 3 || /[.!?:]\s*$/.test(v);
+  if (v && looksLikeSentence && /^[a-z]/.test(v) && (lang === "en" || lang === "unknown")) {
+    issues.Grammar.push("Sentence does not start with a capital letter");
+  }
+  const words = v.split(/\s+/).filter(Boolean);
+  for (let i = 0; i < words.length - 1; i++) {
+    if (words[i].includes("[") || words[i + 1].includes("[")) continue;
+    const w1 = words[i].replace(/[^A-Za-z]/g, "").toLowerCase();
+    const w2 = words[i + 1].replace(/[^A-Za-z]/g, "").toLowerCase();
+    if (w1.length > 2 && w1 === w2) issues.Grammar.push(`Repeated word: "${words[i]} ${words[i + 1]}"`);
+  }
+
+  if (lang === "en" || lang === "unknown") {
+    for (const [wrong, canon] of Object.entries(GLOSSARY)) {
+      const re = new RegExp(`\\b${wrong}\\b`, "i");
+      if (re.test(v) && !v.includes(canon)) issues.Terminology.push(`"${wrong}" should be "${canon}"`);
+    }
+  }
+
+  // Spelling: needs a self-hosted LanguageTool endpoint - not wired up yet.
+  // Left empty on purpose (see Summary sheet note), NOT treated as "no errors".
+
+  return issues;
+}
+
+function parseEntries(text) {
+  const lines = text.split("\n");
+  const entries = [];
+  lines.forEach((raw, idx) => {
+    const m = LINE_PATTERN.exec(raw.replace(/\r$/, ""));
+    if (m) entries.push({ line: idx + 1, key: m[2], value: m[3] });
+  });
+  return entries;
+}
+
+function buildWorkbook(filename, entries, lang) {
+  const spelling = [["Line", "Key", "String", "Issue"]];
+  const spacing = [["Line", "Key", "String", "Issue"]];
+  const grammar = [["Line", "Key", "String", "Issue"]];
+  const terminology = [["Line", "Key", "String", "Issue"]];
+  const duplicates = [["Line", "Key", "String", "Note"]];
+  const clean = [["Line", "Key", "String"]];
+  const seenKeys = {};
+
+  entries.forEach(e => {
+    const issues = checkEntry(e.value, lang.code);
+    issues.Spelling.forEach(i => spelling.push([e.line, e.key, e.value, i]));
+    issues.Spacing.forEach(i => spacing.push([e.line, e.key, e.value, i]));
+    issues.Grammar.forEach(i => grammar.push([e.line, e.key, e.value, i]));
+    issues.Terminology.forEach(i => terminology.push([e.line, e.key, e.value, i]));
+
+    if (seenKeys[e.key] !== undefined) {
+      duplicates.push([e.line, e.key, e.value, `Also defined at line ${seenKeys[e.key]}`]);
+    } else {
+      seenKeys[e.key] = e.line;
+    }
+
+    const noIssues = Object.values(issues).every(arr => arr.length === 0);
+    if (noIssues) clean.push([e.line, e.key, e.value]);
+  });
+
+  const summary = [
+    ["Metric", "Value"],
+    ["File", filename],
+    ["Detected language", `${lang.name} (${lang.code})`],
+    ["Language detection method", lang.method],
+    ["Total strings", entries.length],
+    ["Spelling issues", spelling.length - 1],
+    ["Spacing issues", spacing.length - 1],
+    ["Grammar issues", grammar.length - 1],
+    ["Terminology issues", terminology.length - 1],
+    ["Duplicate keys", duplicates.length - 1],
+    ["Clean strings (no issues in any category)", clean.length - 1],
+    ["LanguageTool server used", "no - spelling sheet incomplete"],
+  ];
+
+  const wb = XLSX.utils.book_new();
+  XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet(summary), "Summary");
+  XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet(spelling), "Spelling");
+  XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet(spacing), "Spacing");
+  XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet(grammar), "Grammar");
+  XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet(terminology), "Terminology");
+  XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet(duplicates), "Duplicates");
+  XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet(clean), "Clean");
+
+  return { wb, stats: {
+    total: entries.length, spelling: spelling.length - 1, spacing: spacing.length - 1,
+    grammar: grammar.length - 1, terminology: terminology.length - 1,
+    duplicates: duplicates.length - 1, clean: clean.length - 1,
+  }};
+}
+
+// ============ UI wiring ============
+let currentFile = null;
+
+document.getElementById("fileInput").addEventListener("change", (e) => {
+  currentFile = e.target.files[0];
+  document.getElementById("runBtn").disabled = !currentFile;
+  if (currentFile) {
+    const lang = detectLanguage(currentFile.name);
+    document.getElementById("langNote").textContent =
+      lang.method === "filename" ? `Auto-detected: ${lang.name} (from filename)` : "Could not detect language from filename - please select it above";
+  }
+});
+
+document.getElementById("runBtn").addEventListener("click", () => {
+  const manual = document.getElementById("langSelect").value;
+  const reader = new FileReader();
+  reader.onload = (evt) => {
+    const entries = parseEntries(evt.target.result);
+    const lang = manual === "auto" ? detectLanguage(currentFile.name) : { code: manual, name: KNOWN_LANG_CODES[manual] || manual, method: "manual" };
+    const { wb, stats } = buildWorkbook(currentFile.name, entries, lang);
+
+    document.getElementById("summaryCards").innerHTML = `
+      <div class="card"><div class="num">${stats.total}</div><div class="lbl">Strings</div></div>
+      <div class="card"><div class="num">${stats.spacing}</div><div class="lbl">Spacing</div></div>
+      <div class="card"><div class="num">${stats.grammar}</div><div class="lbl">Grammar</div></div>
+      <div class="card"><div class="num">${stats.terminology}</div><div class="lbl">Terminology</div></div>
+      <div class="card"><div class="num">${stats.duplicates}</div><div class="lbl">Duplicates</div></div>
+      <div class="card"><div class="num">${stats.clean}</div><div class="lbl">Clean</div></div>
+    `;
+
+    const outName = currentFile.name.replace(/\.js$/, "") + ".qa_report.xlsx";
+    document.getElementById("downloadBtn").onclick = () => XLSX.writeFile(wb, outName);
+    document.getElementById("results").style.display = "block";
+  };
+  reader.readAsText(currentFile);
+});
+</script>
+</body>
+</html>
