@@ -1,0 +1,4 @@
+Flask>=3.0
+openpyxl>=3.1
+# Optional, for real spelling/grammar checks (needs internet + Java to install):
+# language-tool-python>=2.8
