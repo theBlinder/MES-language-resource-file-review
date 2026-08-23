@@ -1,9 +1,0 @@
-__pycache__/
-*.pyc
-.venv/
-venv/
-uploads/*
-!uploads/.gitkeep
-output/*
-!output/.gitkeep
-.DS_Store

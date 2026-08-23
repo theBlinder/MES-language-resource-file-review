@@ -7,3 +7,4 @@ uploads/*
 output/*
 !output/.gitkeep
 .DS_Store
+Downloads/
