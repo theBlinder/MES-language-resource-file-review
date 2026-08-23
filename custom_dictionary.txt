@@ -1,0 +1,9 @@
+# Domain-specific words that are correct for this product but not in a
+# standard English dictionary. One word per line. Add to this as the
+# spelling sheet surfaces more false positives from real terminology.
+preweigh
+packoff
+downtime
+workorder
+sscc
+mins

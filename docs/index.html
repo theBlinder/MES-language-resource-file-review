@@ -1,0 +1,370 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Localization QA Tool</title>
+<script src="https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/typo-js@1.2.1/typo.js"></script>
+<style>
+  body { font-family: -apple-system, Segoe UI, Roboto, sans-serif; background:#f5f6fa; margin:0; padding:32px; color:#222; }
+  .box { max-width:720px; margin:0 auto; }
+  .upload { background:white; border-radius:12px; padding:28px; box-shadow:0 1px 3px rgba(0,0,0,.08); margin-bottom:24px; }
+  h1 { font-size:22px; margin-top:0; }
+  p.sub { color:#666; margin-top:-8px; }
+  input[type=file] { display:block; margin:16px 0; }
+  select { padding:6px 10px; border-radius:6px; border:1px solid #ccc; font-size:14px; }
+  label.row { display:flex; align-items:center; gap:10px; font-size:14px; color:#444; margin:12px 0; }
+  button { background:#2c3e50; color:white; border:none; padding:10px 20px; border-radius:6px; font-size:14px; cursor:pointer; }
+  button:hover { background:#1a252f; }
+  button:disabled { background:#aaa; cursor:not-allowed; }
+  .summary { display:flex; gap:14px; margin-bottom:8px; flex-wrap:wrap; }
+  .card { background:white; border-radius:10px; padding:14px 18px; box-shadow:0 1px 3px rgba(0,0,0,.08); min-width:100px; text-align:center; }
+  .card .num { font-size:24px; font-weight:700; }
+  .card .lbl { font-size:11px; color:#666; margin-top:4px; }
+  a.btn { display:inline-block; background:#16a085; color:white; padding:10px 20px; border-radius:6px; text-decoration:none; font-size:14px; margin-top:16px; cursor:pointer; }
+  .privacy { font-size:12px; color:#999; margin-top:16px; }
+  .langnote { font-size:12px; color:#8e44ad; margin-top:4px; }
+  .status { font-size:12px; color:#c0392b; margin-top:8px; min-height:16px; }
+  #results { display:none; }
+</style>
+</head>
+<body>
+<div class="box">
+
+  <div class="upload">
+    <h1>Localization QA Tool</h1>
+    <p class="sub">Upload a <code>languageResource.KEY = "value";</code> file. Get back one Excel workbook: Spelling, Spacing, Grammar, Terminology, Duplicates, Clean.</p>
+    <input type="file" id="fileInput" accept=".js">
+    <label class="row">
+      Language:
+      <select id="langSelect">
+        <option value="auto">Auto-detect from filename</option>
+        <option value="en">English (en)</option>
+        <option value="de">German (de)</option>
+        <option value="zh">Chinese (zh) - spelling not supported</option>
+        <option value="ja">Japanese (ja) - spelling not supported</option>
+        <option value="fr">French (fr)</option>
+        <option value="es">Spanish (es)</option>
+        <option value="it">Italian (it)</option>
+        <option value="pt">Portuguese (pt)</option>
+        <option value="unknown">Unknown / other</option>
+      </select>
+    </label>
+    <div class="langnote" id="langNote"></div>
+    <button id="runBtn" disabled>Run QA check</button>
+    <div class="status" id="statusMsg"></div>
+    <div class="privacy">Runs 100% in your browser. Your file is never uploaded anywhere.</div>
+  </div>
+
+  <div id="results">
+    <div class="summary" id="summaryCards"></div>
+    <a class="btn" id="downloadBtn">Download Excel report (.xlsx)</a>
+  </div>
+
+</div>
+
+<script>
+// ============ Language config ============
+const KNOWN_LANG_CODES = {
+  en: "English", fr: "French", de: "German", es: "Spanish", it: "Italian",
+  pt: "Portuguese", nl: "Dutch", sv: "Swedish", pl: "Polish", tr: "Turkish",
+  ru: "Russian", ja: "Japanese", zh: "Chinese", ko: "Korean", ar: "Arabic", hi: "Hindi"
+};
+const SPACE_BEFORE_PUNCT_LANGS = new Set(["fr"]);
+const GLOSSARY = { ip: "IP", sop: "SOP", hu: "HU", po: "PO", fg: "FG", qc: "QC", sscc: "SSCC", drl: "DRL" };
+// Hunspell dictionaries only meaningfully exist / apply for space-delimited languages.
+// CJK (zh, ja, ko) need word-segmentation-based tooling, not Hunspell - not attempted here.
+// Dictionaries are bundled in docs/dictionaries/ (same-origin) rather than fetched from
+// an external CDN, so this never silently fails due to network/CDN issues once deployed.
+const SPELLCHECK_DICTS = {
+  en: { code: "en_US", aff: "dictionaries/en_US.aff", dic: "dictionaries/en_US.dic" },
+  // Add more languages here once their .aff/.dic files are added to docs/dictionaries/
+  // (see README - install the matching hunspell-<lang> package, then copy the two files).
+};
+const CUSTOM_DICT_URL = "dictionaries/custom_dictionary.txt";
+const NO_SPELLCHECK_SUPPORT = new Set(["zh", "ja", "ko"]);
+
+const LINE_PATTERN = /^(\s*)languageResource\.([A-Za-z0-9_]+)\s*=\s*"((?:[^"\\]|\\.)*)"(\s*;)?(\s*(\/\/.*)?)\r?$/;
+
+function detectLanguage(filename) {
+  const base = filename.toLowerCase().replace(/\.js$/, "");
+  const tokens = base.split(/[_.\-]/);
+  for (const tok of tokens) {
+    if (KNOWN_LANG_CODES[tok]) return { code: tok, name: KNOWN_LANG_CODES[tok], method: "filename" };
+  }
+  return { code: "unknown", name: "Unknown", method: "unknown" };
+}
+
+// ---- Dictionary loading (bundled Hunspell files, same-origin - no external CDN dependency) ----
+const dictCache = {};
+let customWordsCache = null;
+
+async function loadCustomWords() {
+  if (customWordsCache) return customWordsCache;
+  try {
+    const resp = await fetch(CUSTOM_DICT_URL);
+    if (!resp.ok) { customWordsCache = new Set(); return customWordsCache; }
+    const text = await resp.text();
+    customWordsCache = new Set(
+      text.split("\n").map(l => l.trim().toLowerCase()).filter(l => l && !l.startsWith("#"))
+    );
+  } catch (err) {
+    console.error("Custom dictionary load failed", err);
+    customWordsCache = new Set();
+  }
+  return customWordsCache;
+}
+
+async function loadDictionary(langCode) {
+  if (dictCache[langCode]) return dictCache[langCode];
+  const cfg = SPELLCHECK_DICTS[langCode];
+  if (!cfg) return null;
+  try {
+    const [affResp, dicResp] = await Promise.all([fetch(cfg.aff), fetch(cfg.dic)]);
+    if (!affResp.ok || !dicResp.ok) {
+      throw new Error(`dictionary fetch failed: aff ${affResp.status}, dic ${dicResp.status}`);
+    }
+    const [affText, dicText] = await Promise.all([affResp.text(), dicResp.text()]);
+    const dict = new Typo(cfg.code, affText, dicText);
+    dictCache[langCode] = dict;
+    return dict;
+  } catch (err) {
+    console.error("Dictionary load failed for", langCode, err);
+    return null;
+  }
+}
+
+// Splits a resource string into checkable words, skipping placeholders like [XXX], {name}, %s
+function extractWords(value) {
+  return (value.match(/\b[A-Za-zÀ-ÖØ-öø-ÿ']+\b/g) || []).filter(w => w.length >= 3 && w !== w.toUpperCase());
+}
+
+function spellCheckValue(value, dict, customWords) {
+  if (!dict) return { issues: [], corrected: value };
+  const words = extractWords(value);
+  const issues = [];
+  let corrected = value;
+  for (const w of words) {
+    if (customWords.has(w.toLowerCase())) continue;  // known domain term - not a misspelling
+    if (!dict.check(w)) {
+      const suggestions = dict.suggest(w, 3);
+      const best = suggestions.length ? suggestions[0] : null;
+      issues.push({ word: w, best, all: suggestions });
+      if (best) {
+        const re = new RegExp(`\\b${w.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\b`);
+        corrected = corrected.replace(re, best);
+      }
+    }
+  }
+  return { issues, corrected };
+}
+
+// ---- Structural checks (spacing/grammar/terminology) - language-aware, always run ----
+function structuralFix(value, lang) {
+  const cats = [];
+  let v = value;
+
+  const stripped = v.trim();
+  if (stripped !== v) { cats.push("Spacing: trimmed stray whitespace"); v = stripped; }
+
+  const collapsed = v.replace(/ {2,}/g, " ");
+  if (collapsed !== v) { cats.push("Spacing: collapsed double space"); v = collapsed; }
+
+  const spaced = v.replace(/(?<!\s)([.,!?;:])(?=[A-Za-z])(?!\w*\.(gif|png|jpe?g|pdf|csv|xlsx?))/g, "$1 ");
+  if (spaced !== v) { cats.push("Spacing: added missing space after punctuation"); v = spaced; }
+
+  if (!SPACE_BEFORE_PUNCT_LANGS.has(lang)) {
+    const nospacebefore = v.replace(/\s+([,!?;:])/g, "$1");
+    if (nospacebefore !== v) { cats.push("Spacing: removed unexpected space before punctuation"); v = nospacebefore; }
+  } else {
+    const spacedFr = v.replace(/([A-Za-z])([!?;:])/g, "$1 $2");
+    if (spacedFr !== v) { cats.push("Spacing: added required space before punctuation (French-style)"); v = spacedFr; }
+  }
+
+  const depunct = v.replace(/([!?])\1+/g, "$1");
+  if (depunct !== v) { cats.push("Grammar: collapsed repeated punctuation"); v = depunct; }
+
+  const deperiod = v.replace(/\.\.(?!\.)/g, ".");
+  if (deperiod !== v) { cats.push("Grammar: fixed double period"); v = deperiod; }
+
+  const looksLikeSentence = v.split(/\s+/).filter(Boolean).length >= 3 || /[.!?:]\s*$/.test(v);
+  if (v && looksLikeSentence && /^[a-z]/.test(v) && (lang === "en" || lang === "unknown")) {
+    v = v[0].toUpperCase() + v.slice(1);
+    cats.push("Grammar: capitalized sentence start");
+  }
+
+  const words = v.split(/\s+/).filter(Boolean);
+  for (let i = 0; i < words.length - 1; i++) {
+    if (words[i].includes("[") || words[i + 1].includes("[")) continue;
+    const w1 = words[i].replace(/[^A-Za-z]/g, "").toLowerCase();
+    const w2 = words[i + 1].replace(/[^A-Za-z]/g, "").toLowerCase();
+    if (w1.length > 2 && w1 === w2) cats.push(`Grammar: repeated word "${words[i]} ${words[i + 1]}"`);
+  }
+
+  let terminologyChanged = false;
+  if (lang === "en" || lang === "unknown") {
+    for (const [wrong, canon] of Object.entries(GLOSSARY)) {
+      const re = new RegExp(`\\b${wrong}\\b`, "gi");
+      if (re.test(v) && !v.includes(canon)) {
+        v = v.replace(re, canon);
+        cats.push(`Terminology: "${wrong}" -> "${canon}"`);
+        terminologyChanged = true;
+      }
+    }
+  }
+
+  return { corrected: v, notes: cats };
+}
+
+function parseEntries(text) {
+  const lines = text.split("\n");
+  const entries = [];
+  lines.forEach((raw, idx) => {
+    const m = LINE_PATTERN.exec(raw.replace(/\r$/, ""));
+    if (m) entries.push({ line: idx + 1, key: m[2], value: m[3] });
+  });
+  return entries;
+}
+
+const HEADERS_ISSUE = ["Line", "Resource Key", "Current Value", "Suggested Change"];
+
+async function buildWorkbook(filename, entries, lang) {
+  const spellingSupported = !NO_SPELLCHECK_SUPPORT.has(lang.code) && SPELLCHECK_DICTS[lang.code];
+  let dict = null;
+  let dictError = false;
+  let customWords = new Set();
+  if (spellingSupported) {
+    dict = await loadDictionary(lang.code);
+    if (!dict) dictError = true;
+    customWords = await loadCustomWords();
+  }
+
+  const spelling = [HEADERS_ISSUE];
+  const spacing = [HEADERS_ISSUE];
+  const grammar = [HEADERS_ISSUE];
+  const terminology = [HEADERS_ISSUE];
+  const duplicates = [["Line", "Resource Key", "Current Value", "Note"]];
+  const clean = [["Line", "Resource Key", "Current Value"]];
+  const seenKeys = {};
+
+  entries.forEach(e => {
+    const { corrected: structFixed, notes } = structuralFix(e.value, lang.code);
+
+    let spellIssues = [];
+    let fullyCorrected = structFixed;
+    if (dict) {
+      const sc = spellCheckValue(structFixed, dict, customWords);
+      spellIssues = sc.issues;
+      fullyCorrected = sc.corrected;
+    }
+
+    if (spellIssues.length > 0) spelling.push([e.line, e.key, e.value, fullyCorrected]);
+
+    const spacingNotes = notes.filter(n => n.startsWith("Spacing"));
+    const grammarNotes = notes.filter(n => n.startsWith("Grammar"));
+    const termNotes = notes.filter(n => n.startsWith("Terminology"));
+    if (spacingNotes.length > 0) spacing.push([e.line, e.key, e.value, structFixed]);
+    if (grammarNotes.length > 0) grammar.push([e.line, e.key, e.value, structFixed]);
+    if (termNotes.length > 0) terminology.push([e.line, e.key, e.value, structFixed]);
+
+    let isDup = false;
+    if (seenKeys[e.key] !== undefined) {
+      duplicates.push([e.line, e.key, e.value, `Also defined at line ${seenKeys[e.key]} - needs manual review, not auto-changed`]);
+      isDup = true;
+    } else {
+      seenKeys[e.key] = e.line;
+    }
+
+    const hasAnyIssue = spellIssues.length > 0 || notes.length > 0;
+    if (!hasAnyIssue && !isDup) clean.push([e.line, e.key, e.value]);
+  });
+
+  const summary = [
+    ["Metric", "Value"],
+    ["File", filename],
+    ["Detected language", `${lang.name} (${lang.code})`],
+    ["Language detection method", lang.method],
+    ["Total strings", entries.length],
+    ["Spelling issues", spelling.length - 1],
+    ["Spacing issues", spacing.length - 1],
+    ["Grammar issues", grammar.length - 1],
+    ["Terminology issues", terminology.length - 1],
+    ["Duplicate keys", duplicates.length - 1],
+    ["Clean strings", clean.length - 1],
+    ["Spelling dictionary used", dict ? `Yes (${SPELLCHECK_DICTS[lang.code].code})` : (dictError ? "FAILED TO LOAD - spelling not checked" : "Not supported for this language - spelling not checked")],
+  ];
+
+  const wb = XLSX.utils.book_new();
+  XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet(summary), "Summary");
+  XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet(spelling), "Spelling");
+  XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet(spacing), "Spacing");
+  XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet(grammar), "Grammar");
+  XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet(terminology), "Terminology");
+  XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet(duplicates), "Duplicates");
+  XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet(clean), "Clean");
+
+  return { wb, dictError, spellingSupported, stats: {
+    total: entries.length, spelling: spelling.length - 1, spacing: spacing.length - 1,
+    grammar: grammar.length - 1, terminology: terminology.length - 1,
+    duplicates: duplicates.length - 1, clean: clean.length - 1,
+  }};
+}
+
+// ============ UI wiring ============
+let currentFile = null;
+
+document.getElementById("fileInput").addEventListener("change", (e) => {
+  currentFile = e.target.files[0];
+  document.getElementById("runBtn").disabled = !currentFile;
+  if (currentFile) {
+    const lang = detectLanguage(currentFile.name);
+    document.getElementById("langNote").textContent =
+      lang.method === "filename" ? `Auto-detected: ${lang.name} (from filename)` : "Could not detect language from filename - please select it above";
+  }
+});
+
+document.getElementById("runBtn").addEventListener("click", async () => {
+  const manual = document.getElementById("langSelect").value;
+  const statusEl = document.getElementById("statusMsg");
+  const runBtn = document.getElementById("runBtn");
+  runBtn.disabled = true;
+  statusEl.textContent = "Checking...";
+  statusEl.style.color = "#666";
+
+  const reader = new FileReader();
+  reader.onload = async (evt) => {
+    const entries = parseEntries(evt.target.result);
+    const lang = manual === "auto" ? detectLanguage(currentFile.name) : { code: manual, name: KNOWN_LANG_CODES[manual] || manual, method: "manual" };
+
+    const { wb, dictError, spellingSupported, stats } = await buildWorkbook(currentFile.name, entries, lang);
+
+    if (NO_SPELLCHECK_SUPPORT.has(lang.code)) {
+      statusEl.style.color = "#c0392b";
+      statusEl.textContent = `Note: dictionary spelling check is not supported for ${lang.name} - Spelling sheet will be empty. Other checks still ran.`;
+    } else if (dictError) {
+      statusEl.style.color = "#c0392b";
+      statusEl.textContent = `Note: spelling dictionary failed to load (check your internet connection) - Spelling sheet is empty this run.`;
+    } else {
+      statusEl.textContent = "";
+    }
+
+    document.getElementById("summaryCards").innerHTML = `
+      <div class="card"><div class="num">${stats.total}</div><div class="lbl">Strings</div></div>
+      <div class="card"><div class="num">${stats.spelling}</div><div class="lbl">Spelling</div></div>
+      <div class="card"><div class="num">${stats.spacing}</div><div class="lbl">Spacing</div></div>
+      <div class="card"><div class="num">${stats.grammar}</div><div class="lbl">Grammar</div></div>
+      <div class="card"><div class="num">${stats.terminology}</div><div class="lbl">Terminology</div></div>
+      <div class="card"><div class="num">${stats.duplicates}</div><div class="lbl">Duplicates</div></div>
+      <div class="card"><div class="num">${stats.clean}</div><div class="lbl">Clean</div></div>
+    `;
+
+    const outName = currentFile.name.replace(/\.js$/, "") + ".qa_report.xlsx";
+    document.getElementById("downloadBtn").onclick = () => XLSX.writeFile(wb, outName);
+    document.getElementById("results").style.display = "block";
+    runBtn.disabled = false;
+  };
+  reader.readAsText(currentFile);
+});
+</script>
+</body>
+</html>
