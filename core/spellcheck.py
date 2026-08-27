@@ -147,6 +147,14 @@ REAL_WORD_TYPO_FIXES = {
     # to be "please" in this context. Same discipline as "caned" above -
     # one curated entry for one specific, verified case.
     "pleas": "please",
+    # MRG's real reported example (2026-08-27): "Sech by mixer" - "sech" is
+    # a real dictionary word (the hyperbolic secant function, a math term -
+    # verified directly that hunspell's en_US dictionary accepts it and
+    # therefore never flags it), but in this UI-label context it's clearly
+    # meant to be "search". Same discipline as "caned"/"pleas" above - one
+    # curated entry for one specific, verified case. Keep in sync with
+    # REAL_WORD_TYPO_FIXES in docs/index.html.
+    "sech": "search",
 }
 
 # Exact-typo -> definitely-correct-fix overrides, for cases where BOTH

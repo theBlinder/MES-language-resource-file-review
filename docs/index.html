@@ -6,62 +6,91 @@
 <script src="https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/typo-js@1.2.1/typo.js"></script>
 <style>
-  @import url('https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;600;700&family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500;600&display=swap');
+  @import url('https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;600;700&family=IBM+Plex+Sans:wght@400;500;600&display=swap');
 
   :root {
-    --paper: #F2F3EE;
+    --paper: #F7F8F5;
     --ink: #1C2521;
-    --line: #D7DAD1;
-    --muted: #63706A;
+    --line: #E1E4DC;
+    --muted: #6B7A73;
     --pass: #1F6F5C;
     --pass-bg: #E7F1EE;
     --flag: #B5432B;
     --flag-bg: #FBECE7;
   }
   * { box-sizing: border-box; }
+  html, body { margin: 0; }
   body {
     font-family: 'IBM Plex Sans', -apple-system, sans-serif;
-    background: var(--paper);
     color: var(--ink);
-    margin: 0;
-    padding: 48px 24px;
-    line-height: 1.5;
+    min-height: 100vh;
+    line-height: 1.45;
+    background:
+      linear-gradient(120deg, rgba(31,111,92,0.10), transparent 34%),
+      linear-gradient(315deg, rgba(181,67,43,0.07), transparent 40%),
+      var(--paper);
   }
-  .box { max-width: 760px; margin: 0 auto; }
 
+  /* The card below caps its own height well under any normal window
+     (max-height: 640px - its actual content is ~500px, so that's a real
+     safety margin, not a tight fit) and scrolls internally past that, so
+     .page's total height (padding + the taller of intro/card) stays
+     comfortably under 100vh on any normal laptop/desktop window without
+     needing fragile "100vh minus a guessed number of pixels" math - that
+     kind of exact-fit calc was what broke last time (real webfont metrics
+     render taller than the fallback fonts this was checked against, and
+     the leftover gap between the estimate and reality is exactly what
+     turned into an unwanted page scrollbar). If a window is ever too
+     small even for that, .page's own min-height lets the page itself
+     scroll rather than silently clipping content - see the max-height/
+     max-width media query below for the deliberate small-screen fallback. */
+  .page {
+    min-height: 100vh;
+    max-width: 1180px;
+    margin: 0 auto;
+    padding: 40px 32px;
+    display: grid;
+    grid-template-columns: 0.8fr 1.2fr;
+    align-items: center;
+    gap: 48px;
+  }
+
+  .intro { min-width: 0; }
   .eyebrow {
-    font-family: 'IBM Plex Mono', monospace;
-    font-size: 11px;
-    letter-spacing: 0.14em;
-    text-transform: uppercase;
-    color: var(--muted);
-    margin: 0 0 6px;
+    display: inline-flex; align-items: center; gap: 8px;
+    margin: 0 0 14px; color: var(--pass);
+    font-size: 12px; font-weight: 700; letter-spacing: 0.1em; text-transform: uppercase;
   }
-  h1 {
+  .eyebrow::before { content: ""; width: 26px; height: 2px; background: var(--pass); border-radius: 999px; }
+  .intro h1 {
     font-family: 'Space Grotesk', sans-serif;
-    font-size: 28px;
-    font-weight: 600;
-    margin: 0 0 6px;
-    letter-spacing: -0.01em;
+    margin: 0 0 14px; color: var(--ink);
+    font-size: clamp(28px, 3.6vw, 40px); line-height: 1.12; font-weight: 600; letter-spacing: -0.01em;
   }
-  p.sub { color: var(--muted); margin: 0 0 24px; max-width: 56ch; }
-  p.sub code {
-    background: #E5E7E0; padding: 1px 6px; border-radius: 4px;
-    font-family: 'IBM Plex Mono', monospace; font-size: 0.9em;
-  }
+  .intro p { margin: 0; max-width: 40ch; color: var(--muted); font-size: 15px; line-height: 1.6; }
 
-  .upload {
+  .steps { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-top: 28px; font-size: 13px; font-weight: 600; color: var(--ink); }
+  .steps span:not(:last-child)::after { content: "→"; margin-left: 8px; color: var(--pass); font-weight: 400; }
+
+  .card {
     background: white;
     border: 1px solid var(--line);
     border-radius: 14px;
-    padding: 28px;
-    margin-bottom: 28px;
+    padding: 28px 30px;
+    max-height: min(640px, 84vh);
+    overflow-y: auto;
+    min-width: 0;
+  }
+
+  code {
+    background: #ECEEE7; padding: 1px 6px; border-radius: 4px;
+    font-size: 0.9em;
   }
 
   .dropzone {
-    border: 1.5px dashed #B7BDB2;
+    border: 1.5px dashed #C4C9BC;
     border-radius: 10px;
-    padding: 28px 20px;
+    padding: 30px 18px;
     text-align: center;
     cursor: pointer;
     transition: border-color 0.15s ease, background 0.15s ease;
@@ -71,118 +100,124 @@
   .dropzone input[type=file] { position: absolute; inset: 0; opacity: 0; cursor: pointer; }
   .dropzone .dz-title { font-weight: 600; font-size: 14px; margin-bottom: 3px; }
   .dropzone .dz-sub { font-size: 12px; color: var(--muted); }
-  .dropzone .dz-file {
-    font-family: 'IBM Plex Mono', monospace; font-size: 13px;
-    color: var(--pass); margin-top: 8px; font-weight: 500;
-  }
+  .dropzone .dz-file { font-size: 13px; color: var(--pass); margin-top: 8px; font-weight: 600; }
 
-  .row { display: flex; align-items: center; gap: 10px; margin-top: 18px; font-size: 14px; }
+  .row { display: flex; align-items: center; gap: 10px; margin-top: 14px; font-size: 14px; }
   select {
     padding: 7px 10px; border-radius: 7px; border: 1px solid var(--line);
     font-size: 14px; font-family: inherit; background: white; color: var(--ink);
   }
 
   button {
-    background: var(--ink); color: white; border: none;
-    padding: 11px 22px; border-radius: 8px; font-size: 14px; font-weight: 500;
-    cursor: pointer; margin-top: 20px; font-family: inherit;
-    transition: transform 0.1s ease, background 0.15s ease;
+    width: 100%;
+    background: var(--pass); color: white; border: none;
+    padding: 12px 22px; border-radius: 8px; font-size: 14px; font-weight: 600;
+    cursor: pointer; margin-top: 18px; font-family: inherit;
+    transition: transform 0.1s ease, opacity 0.15s ease;
   }
-  button:hover:not(:disabled) { background: #333; transform: translateY(-1px); }
-  button:disabled { background: #B7BDB2; cursor: not-allowed; }
+  button:hover:not(:disabled) { transform: translateY(-1px); }
+  button:disabled { opacity: 0.45; cursor: not-allowed; transform: none; }
 
-  .status { font-size: 13px; margin-top: 10px; min-height: 16px; }
+  .status { font-size: 13px; margin-top: 10px; min-height: 16px; color: var(--muted); }
   .status.error { color: var(--flag); }
-  .privacy {
-    font-size: 12px; color: var(--muted); margin-top: 18px;
-    display: flex; align-items: center; gap: 6px;
-  }
-  .privacy::before { content: "●"; color: var(--pass); font-size: 8px; }
+  .privacy { font-size: 12px; color: var(--muted); margin-top: 14px; }
 
-  .langnote { font-size: 12px; color: var(--muted); margin-top: 6px; font-style: italic; }
+  .langnote { font-size: 12px; color: var(--muted); margin-top: 6px; }
 
   #results { display: none; }
-  .stamps { display: flex; gap: 12px; flex-wrap: wrap; margin-bottom: 24px; }
+  .filename { font-size: 14px; color: var(--ink); font-weight: 600; margin-bottom: 18px; word-break: break-all; }
+
+  .stamps { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 22px; }
   .stamp {
-    background: white; border: 2px solid var(--line); border-radius: 50%;
-    width: 92px; height: 92px; display: flex; flex-direction: column;
-    align-items: center; justify-content: center; text-align: center;
-    animation: stampIn 0.25s ease backwards;
+    background: white; border: 1.5px solid var(--line); border-radius: 10px;
+    flex: 1 1 72px; padding: 10px 4px;
+    display: flex; flex-direction: column; align-items: center; justify-content: center; text-align: center;
   }
   .stamp.flagged { border-color: var(--flag); background: var(--flag-bg); }
   .stamp.clean { border-color: var(--pass); background: var(--pass-bg); }
-  .stamp .n {
-    font-family: 'IBM Plex Mono', monospace; font-size: 22px; font-weight: 600;
-    line-height: 1;
-  }
+  .stamp .n { font-size: 19px; font-weight: 700; line-height: 1; }
   .stamp.flagged .n { color: var(--flag); }
   .stamp.clean .n { color: var(--pass); }
-  .stamp .l { font-size: 10px; letter-spacing: 0.04em; text-transform: uppercase; color: var(--muted); margin-top: 4px; }
-  @keyframes stampIn { from { opacity: 0; transform: scale(0.8); } to { opacity: 1; transform: scale(1); } }
+  .stamp .l { font-size: 9px; letter-spacing: 0.03em; text-transform: uppercase; color: var(--muted); margin-top: 4px; }
 
-  a.btn {
-    display: inline-block; background: var(--pass); color: white;
-    padding: 12px 24px; border-radius: 8px; text-decoration: none;
-    font-size: 14px; font-weight: 500; cursor: pointer;
-    transition: transform 0.1s ease;
+  .results-actions { display: flex; align-items: center; gap: 16px; flex-wrap: wrap; }
+  .results-actions button { width: auto; flex: 1 1 auto; margin-top: 0; }
+
+  a.btn-ghost {
+    color: var(--muted); text-decoration: none;
+    font-size: 13px; font-weight: 600; cursor: pointer;
   }
-  a.btn:hover { transform: translateY(-1px); }
+  a.btn-ghost:hover { color: var(--ink); }
 
-  .filename {
-    font-family: 'IBM Plex Mono', monospace; font-size: 13px; color: var(--muted); margin-bottom: 14px;
+  @media (max-width: 820px), (max-height: 560px) {
+    .page { grid-template-columns: 1fr; padding: 28px 20px; gap: 24px; }
+    .intro { text-align: center; }
+    .intro p { margin-left: auto; margin-right: auto; }
+    .eyebrow { justify-content: center; }
+    .steps { justify-content: center; }
+    .card { max-height: none; }
   }
 </style>
 </head>
 <body>
-<div class="box">
 
-  <div class="upload">
-    <p class="eyebrow">Resource file inspection</p>
-    <h1>Localization QA Tool</h1>
-    <p class="sub">Upload a <code>languageResource.KEY = "value";</code> file. Get back one Excel workbook, sheet per finding: Spelling, Spacing, Grammar, Terminology, Duplicates, Clean.</p>
+  <main class="page">
+    <section class="intro">
+      <p class="eyebrow">Resource file QA</p>
+      <h1>Check your resource files before they go live.</h1>
+      <p>This tool scans a resource file for spelling mistakes, grammar problems, and formatting issues. Upload your file and it checks every text string in seconds &mdash; nothing to install. You'll get back one Excel report listing everything worth a second look.</p>
+      <div class="steps">
+        <span>Upload</span>
+        <span>Check</span>
+        <span>Download</span>
+      </div>
+    </section>
 
-    <div class="dropzone" id="dropzone">
-      <input type="file" id="fileInput" accept=".js">
-      <div class="dz-title">Drop a .js resource file here</div>
-      <div class="dz-sub">or click to browse</div>
-      <div class="dz-file" id="dzFile"></div>
-    </div>
+    <section class="card" id="uploadPanel">
+      <div class="dropzone" id="dropzone">
+        <input type="file" id="fileInput" accept=".js">
+        <div class="dz-title">Drop a .js resource file here</div>
+        <div class="dz-sub">or click to browse</div>
+        <div class="dz-file" id="dzFile"></div>
+      </div>
 
-    <label class="row">
-      Language:
-      <select id="langSelect">
-        <option value="auto">Auto-detect from filename</option>
-        <option value="en">English (en)</option>
-        <option value="de">German (de)</option>
-        <option value="zh">Chinese (zh) - spelling not supported</option>
-        <option value="ja">Japanese (ja) - spelling not supported</option>
-        <option value="fr">French (fr)</option>
-        <option value="es">Spanish (es)</option>
-        <option value="it">Italian (it)</option>
-        <option value="pt">Portuguese (pt)</option>
-        <option value="unknown">Unknown / other</option>
-      </select>
-    </label>
-    <div class="langnote" id="langNote"></div>
+      <label class="row">
+        Language:
+        <select id="langSelect">
+          <option value="auto">Auto-detect from filename</option>
+          <option value="en">English (en)</option>
+          <option value="de">German (de)</option>
+          <option value="zh">Chinese (zh) - spelling not supported</option>
+          <option value="ja">Japanese (ja) - spelling not supported</option>
+          <option value="fr">French (fr)</option>
+          <option value="es">Spanish (es)</option>
+          <option value="it">Italian (it)</option>
+          <option value="pt">Portuguese (pt)</option>
+          <option value="unknown">Unknown / other</option>
+        </select>
+      </label>
+      <div class="langnote" id="langNote"></div>
 
-    <label class="row">
-      <input type="checkbox" id="deepCheckToggle" style="width:auto;margin-right:6px;">
-      Deep grammar check (beta) - catches context errors no dictionary can (e.g. wrong verb forms)
-    </label>
-    <div class="langnote" id="deepCheckNote" style="display:none;">Sends this file's text to an external grammar service (languagetool.org), one file at a time. Slower - large files are checked in paced batches to respect that service's usage limits.</div>
+      <label class="row">
+        <input type="checkbox" id="deepCheckToggle" style="width:auto;margin-right:6px;">
+        Deep grammar check (beta)
+      </label>
+      <div class="langnote" id="deepCheckNote" style="display:none;">Also sends this file's text to languagetool.org, one file at a time.</div>
 
-    <button id="runBtn" disabled>Run QA check</button>
-    <div class="status" id="statusMsg"></div>
-    <div class="privacy" id="privacyNote">Runs 100% in your browser. Your file is never uploaded anywhere.</div>
-  </div>
+      <button id="runBtn" disabled>Run QA check</button>
+      <div class="status" id="statusMsg"></div>
+      <div class="privacy" id="privacyNote">Runs 100% in your browser. Your file is never uploaded anywhere.</div>
+    </section>
 
-  <div id="results">
-    <div class="filename" id="resultFilename"></div>
-    <div class="stamps" id="summaryCards"></div>
-    <a class="btn" id="downloadBtn">Download Excel report (.xlsx)</a>
-  </div>
-
-</div>
+    <section class="card" id="results">
+      <div class="filename" id="resultFilename"></div>
+      <div class="stamps" id="summaryCards"></div>
+      <div class="results-actions">
+        <button id="downloadBtn">Download Excel report</button>
+        <a class="btn-ghost" id="resetBtn">← Check another file</a>
+      </div>
+    </section>
+  </main>
 
 <script>
 // ============ Language config ============
@@ -410,6 +445,14 @@ const REAL_WORD_TYPO_FIXES = {
   // curated entry for one specific, verified case. Keep in sync with
   // REAL_WORD_TYPO_FIXES in core/spellcheck.py.
   pleas: "please",
+  // MRG's real reported example (2026-08-27): "Sech by mixer" - "sech" is
+  // a real dictionary word (the hyperbolic secant function, a math term -
+  // verified directly that typo-js's bundled en_US dictionary accepts it
+  // and therefore never flags it), but in this UI-label context it's
+  // clearly meant to be "search". Same discipline as "caned"/"pleas" above
+  // - one curated entry for one specific, verified case. Keep in sync with
+  // REAL_WORD_TYPO_FIXES in core/spellcheck.py.
+  sech: "search",
 };
 
 function trySplitCamelCase(word, dict) {
@@ -930,25 +973,41 @@ async function buildWorkbook(filename, entries, lang, deepCheck) {
     // Deep-check (beta) findings for this exact string, if the caller
     // opted in. `ltCategorize` already sorted each match into Spelling or
     // Grammar - folded into the same counts/routing as everything else so
-    // a deep-check-only finding still lands the row on the right sheet,
-    // and (when it offers a replacement) into the same "Suggested Change"
-    // text, same as every other check. See runDeepGrammarCheck() for how
-    // these are gathered.
+    // a deep-check-only finding still lands the row on the right sheet.
+    // See runDeepGrammarCheck() for how these are gathered.
+    //
+    // BUG FIX (2026-08-27, round 6): a deep-check replacement is NO LONGER
+    // auto-applied into "Suggested Change". MRG's real reported example:
+    // "Failed to load labels pending for confirmation" came back as
+    // "Failed to lad labels..." - LanguageTool (with the beta box checked)
+    // flagged "load" and its top suggestion was "lad", which got silently
+    // substituted straight into Suggested Change with no sanity check at
+    // all. Every OTHER suggestion source in this file (raw hunspell/typo-js
+    // suggestions) is gated by isConfidentSuggestion/_is_confident before
+    // being auto-applied - this was the one path that had no gate
+    // whatsoever, and it directly violates this project's own standing
+    // rule (CLAUDE.md Requirement #2): "Auto-fix simultaneously where
+    // safe; suggestions must always be reviewable, never blindly applied."
+    // A third-party service's suggestion can't be verified safe the way a
+    // curated exact-match table can. Also, the substitution itself used an
+    // unanchored `fullyCorrected.replace(matchedText, replacement)` -
+    // first-occurrence substring replace, not tied to the actual offset
+    // LanguageTool reported - a second, independent fragility on top of
+    // the missing confidence gate. Fix: deep-check findings are still
+    // fully surfaced (folded into routing/counts, and every match's
+    // "[matched text] -> [suggestion]: message" shown in the Spelling
+    // "Words To Correct" / Grammar "Deep Check Notes" column) but never
+    // silently written into "Suggested Change" - same as how a
+    // low-confidence dictionary guess is shown but not auto-applied.
     const ltMatches = deepCheckEnabled ? (deepCheck.results.get(`${e.key}:${e.line}`) || []) : [];
     const ltSpellingMatches = ltMatches.filter(m => m.category === "Spelling");
     const ltGrammarMatches = ltMatches.filter(m => m.category === "Grammar");
     deepCheckIssueCount += ltMatches.length;
-    for (const m of ltGrammarMatches) {
-      if (m.matchedText && m.replacement && fullyCorrected.includes(m.matchedText)) {
-        fullyCorrected = fullyCorrected.replace(m.matchedText, m.replacement);
-      }
+    function formatLtNote(m) {
+      return (m.matchedText && m.replacement)
+        ? `"${m.matchedText}" → "${m.replacement}": ${m.message}`
+        : m.message;
     }
-    for (const m of ltSpellingMatches) {
-      if (m.matchedText && m.replacement && fullyCorrected.includes(m.matchedText)) {
-        fullyCorrected = fullyCorrected.replace(m.matchedText, m.replacement);
-      }
-    }
-
     // Each string lands in exactly ONE sheet - the single best-fitting
     // category - rather than being duplicated into every sheet whose check
     // found something. Which sheet wins: whichever category has the MOST
@@ -974,11 +1033,11 @@ async function buildWorkbook(filename, entries, lang, deepCheck) {
       const wordsCol = spellIssues.map(iss => {
         const alt = iss.alternatives.length ? ` (or: ${iss.alternatives.join(", ")})` : "";
         return iss.best ? `"${iss.word}" → "${iss.best}"${alt}` : `"${iss.word}" - no confident suggestion`;
-      }).concat(ltSpellingMatches.map(m => `[deep check] ${m.message}`)).join(";  ");
+      }).concat(ltSpellingMatches.map(m => `[deep check, not auto-applied] ${formatLtNote(m)}`)).join(";  ");
       spelling.push([e.line, e.key, e.value, fullyCorrected, wordsCol]);
     } else if (chosenCategory === "Grammar") {
       const row = [e.line, e.key, e.value, fullyCorrected];
-      if (deepCheckEnabled) row.push(ltGrammarMatches.map(m => m.message).join(";  "));
+      if (deepCheckEnabled) row.push(ltGrammarMatches.map(m => `[not auto-applied] ${formatLtNote(m)}`).join(";  "));
       grammar.push(row);
     } else if (chosenCategory === "Terminology") {
       terminology.push([e.line, e.key, e.value, fullyCorrected]);
@@ -1134,10 +1193,29 @@ document.getElementById("runBtn").addEventListener("click", async () => {
 
     const outName = currentFile.name.replace(/\.js$/, "") + ".qa_report.xlsx";
     document.getElementById("downloadBtn").onclick = () => XLSX.writeFile(wb, outName);
+    // Swap panels rather than stacking the report below the upload form -
+    // this is a one-upload-one-download flow, so only one panel needs to
+    // be on screen at a time (keeps the page fitting in the viewport
+    // instead of growing taller with every run).
+    document.getElementById("uploadPanel").style.display = "none";
     document.getElementById("results").style.display = "block";
     runBtn.disabled = false;
   };
   reader.readAsText(currentFile);
+});
+
+// "Check another file" - resets back to the upload panel without a full
+// page reload, so a second file doesn't require re-fetching the dictionary.
+document.getElementById("resetBtn").addEventListener("click", () => {
+  currentFile = null;
+  fileInput.value = "";
+  document.getElementById("dzFile").textContent = "";
+  document.getElementById("langNote").textContent = "";
+  document.getElementById("statusMsg").className = "status";
+  document.getElementById("statusMsg").textContent = "";
+  document.getElementById("runBtn").disabled = true;
+  document.getElementById("results").style.display = "none";
+  document.getElementById("uploadPanel").style.display = "block";
 });
 </script>
 </body>
