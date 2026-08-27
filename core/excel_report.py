@@ -15,7 +15,7 @@ Spelling. This is a per-string count, not a fixed category ranking. Ties
 categories" case) fall back to a fixed order - Spelling > Grammar >
 Terminology > Spacing - as a deterministic tie-break; MRG has not specified
 a preferred tie-break, so this uses the previously-agreed default (Section 8
-Q1 in CLAUDE.md). Flag if a different tie-break is wanted.
+Q1 in PROJECT_ARCHIVE.md). Flag if a different tie-break is wanted.
 The Suggested Change column always reflects ALL fixes together regardless
 of which single sheet the row landed in.
 """

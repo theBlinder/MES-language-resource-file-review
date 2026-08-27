@@ -8,7 +8,7 @@ output/*
 !output/.gitkeep
 .DS_Store
 
-# Internal context/handoff docs - kept local only. See CLAUDE.md's own
-# Section 3 for why (not repeated here on purpose - this file is public).
-CLAUDE.md
-HANDOFF.md
+# Internal context/handoff doc - kept local only (contains internal notes
+# not meant for the public repo). Formerly CLAUDE.md; renamed so it isn't
+# auto-loaded into every AI conversation - see its own header note.
+PROJECT_ARCHIVE.md

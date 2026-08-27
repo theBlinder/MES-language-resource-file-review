@@ -198,12 +198,6 @@
       </label>
       <div class="langnote" id="langNote"></div>
 
-      <label class="row">
-        <input type="checkbox" id="deepCheckToggle" style="width:auto;margin-right:6px;">
-        Deep grammar check (beta)
-      </label>
-      <div class="langnote" id="deepCheckNote" style="display:none;">Also sends this file's text to languagetool.org, one file at a time.</div>
-
       <button id="runBtn" disabled>Run QA check</button>
       <div class="status" id="statusMsg"></div>
       <div class="privacy" id="privacyNote">Runs 100% in your browser. Your file is never uploaded anywhere.</div>
@@ -726,184 +720,6 @@ function structuralFix(value, lang, mixedCaseWords, customWordsForCasing) {
   return { corrected: v, notes: cats };
 }
 
-// ---- Optional "Deep Grammar Check" (opt-in, beta, added 2026-08-27) ----
-// Calls the free PUBLIC LanguageTool API (https://api.languagetool.org) -
-// this is NOT self-hosted and NOT part of the default 100%-local flow.
-// Off by default; MRG explicitly asked for real-time/context-aware
-// checking given the earlier dictionary/regex-only checks can't catch
-// context-dependent grammar errors (e.g. "want to unselected" - a validly
-// spelled but grammatically wrong verb form; see Open Item #4 in
-// CLAUDE.md). This is deliberately OPT-IN and PACED, never automatic on
-// every check: the free API's own documented terms say "do not send
-// automated requests" and cap usage at 20 requests/IP/minute, 75KB
-// text/IP/minute, 20KB text/request (dev.languagetool.org/public-http-api,
-// checked 2026-08-27) - a whole-company tool silently calling this on
-// every file load for every one of 400-500 files would very likely get
-// Vegam's office IP rate-limited or blocked. So: manual checkbox, one file
-// at a time, requests kept comfortably under those limits with a delay
-// between chunks.
-//
-// IMPORTANT / UNVERIFIED: this specific external call could NOT be
-// live-tested from the sandbox this was built in (its network egress does
-// not reach languagetool.org) - the request/response shape below is built
-// from LanguageTool's own documented API contract (endpoint, `text` +
-// `language` params, `matches[].offset/length/message/shortMessage/
-// replacements/rule.category`), not confirmed against a real live
-// response. MUST be tested against the real site (which has normal
-// internet access) before relying on it - if the response shape has
-// changed since this was written, this will fail loudly (network/parse
-// error surfaced per string, see runDeepGrammarCheck's error handling)
-// rather than silently doing nothing.
-const LT_ENDPOINT = "https://api.languagetool.org/v2/check";
-const LT_MAX_CHARS_PER_REQUEST = 15000; // documented cap is 20KB/request - leave headroom
-const LT_REQUESTS_PER_MINUTE = 15;      // documented cap is 20/minute - leave headroom
-const LT_RATE_WINDOW_MS = 60000;
-const LT_RATE_LOG_KEY = "locQaTool_ltRequestLog";
-
-function ltCategorize(match) {
-  const issueType = (match.rule && (match.rule.issueType || (match.rule.category && match.rule.category.id))) || "";
-  return /typo|misspelling/i.test(issueType) ? "Spelling" : "Grammar";
-}
-
-// Keeps this browser under LT_REQUESTS_PER_MINUTE across the ROLLING LAST
-// MINUTE - not just within one file's own chunk loop. Added 2026-08-27
-// after MRG asked what happens if someone runs 20+ files within an hour:
-// the original version only paced requests WITHIN a single
-// runDeepGrammarCheck() call, so running several files back-to-back (or
-// reloading the page and starting another file right away) had no memory
-// of what was already sent and could exceed the free API's limit on its
-// own. Fix: persist each request's timestamp in localStorage (survives
-// across separate file runs and page reloads, but is scoped to THIS
-// browser only - see the important caveat below) and, before every
-// request, wait however long is needed to stay at or under the limit.
-//
-// IMPORTANT CAVEAT: LanguageTool's free-tier limit is per-IP, not
-// per-browser. This only coordinates requests from one person's own
-// browser. If several Vegam employees are checking files around the same
-// time from behind the same office network (so they all look like one IP
-// to LanguageTool), each person's browser has no way to know what anyone
-// else's browser is doing - localStorage is never shared between
-// different people's machines, and this is a backend-less static site so
-// there's nowhere to keep a shared counter. In that scenario the SHARED
-// limit could still be hit even though each individual browser is pacing
-// itself correctly. That's not a crash - see runDeepGrammarCheck's error
-// handling below - a request that gets rate-limited (HTTP 429) is simply
-// treated as "not checked" for those specific strings, same as a network
-// failure. If this turns out to matter in practice (busy periods, many
-// people checking files at once), the real fix is a LanguageTool
-// Enterprise/paid key (removes the shared limit) rather than more
-// client-side pacing, which can't see across different people's browsers.
-function ltWaitForRateLimit() {
-  let log;
-  try {
-    log = JSON.parse(localStorage.getItem(LT_RATE_LOG_KEY) || "[]");
-    if (!Array.isArray(log)) log = [];
-  } catch (err) {
-    // localStorage unavailable (private browsing, disabled, quota, etc.) -
-    // fall back to no persistent pacing rather than crashing the check.
-    return Promise.resolve();
-  }
-  const now = Date.now();
-  log = log.filter(t => now - t < LT_RATE_WINDOW_MS);
-  const wait = log.length >= LT_REQUESTS_PER_MINUTE
-    ? Math.max(0, LT_RATE_WINDOW_MS - (now - log[0]) + 250) // +250ms safety margin
-    : 0;
-  const record = () => {
-    try {
-      const freshNow = Date.now();
-      const fresh = log.filter(t => freshNow - t < LT_RATE_WINDOW_MS);
-      fresh.push(freshNow);
-      localStorage.setItem(LT_RATE_LOG_KEY, JSON.stringify(fresh));
-    } catch (err) { /* ignore - see comment above */ }
-  };
-  if (wait <= 0) { record(); return Promise.resolve(); }
-  return new Promise(resolve => setTimeout(() => { record(); resolve(); }, wait));
-}
-
-// One HTTP call. `text` may contain multiple resource strings joined by
-// "\n" (LanguageTool treats each line as its own sentence context).
-// Returns the raw `matches` array from LanguageTool's response. Always
-// waits for ltWaitForRateLimit() first - see that function for why this
-// needs to persist across separate calls, not just pace within one loop.
-async function ltCheckBatch(text) {
-  await ltWaitForRateLimit();
-  const body = new URLSearchParams({ text, language: "en-US" });
-  const resp = await fetch(LT_ENDPOINT, {
-    method: "POST",
-    headers: { "Content-Type": "application/x-www-form-urlencoded" },
-    body,
-  });
-  if (!resp.ok) {
-    throw new Error(`LanguageTool request failed: HTTP ${resp.status}`);
-  }
-  const data = await resp.json();
-  return data.matches || [];
-}
-
-// Splits `entries` into request-sized chunks (respecting
-// LT_MAX_CHARS_PER_REQUEST), calls the API once per chunk - each call
-// paced by ltCheckBatch()'s built-in rate-limit wait, which persists
-// across chunks AND across separate runDeepGrammarCheck() calls (separate
-// file runs) - and maps each match back to the specific entry it belongs
-// to via character offset into the chunk's combined text.
-// onProgress(doneChunks, totalChunks) fires after each chunk - this can be
-// a slow, deliberately-paced, multi-request operation for a large file.
-// Returns { results, errors } - results: Map("key:line" -> [{message,
-// matchedText, replacement, category}]); errors: array of "key:line"
-// strings whose chunk failed (network error, rate-limited, etc.) - treated
-// as "not checked", same discipline as every other "dictionary not
-// available" case in this project, never silently as "clean".
-async function runDeepGrammarCheck(entries, onProgress) {
-  const results = new Map();
-  const errors = [];
-  const chunks = [];
-  let current = [];
-  let currentLen = 0;
-  for (const e of entries) {
-    const lineLen = e.value.length + 1; // +1 for the joining newline
-    if (currentLen + lineLen > LT_MAX_CHARS_PER_REQUEST && current.length) {
-      chunks.push(current);
-      current = [];
-      currentLen = 0;
-    }
-    current.push(e);
-    currentLen += lineLen;
-  }
-  if (current.length) chunks.push(current);
-
-  for (let i = 0; i < chunks.length; i++) {
-    const chunk = chunks[i];
-    const text = chunk.map(e => e.value).join("\n");
-    const offsets = [];
-    let pos = 0;
-    for (const e of chunk) {
-      offsets.push({ start: pos, end: pos + e.value.length, entry: e });
-      pos += e.value.length + 1;
-    }
-    try {
-      const matches = await ltCheckBatch(text);
-      for (const m of matches) {
-        const owner = offsets.find(o => m.offset >= o.start && m.offset < o.end);
-        if (!owner) continue; // landed on the joining newline itself - skip
-        const key = `${owner.entry.key}:${owner.entry.line}`;
-        if (!results.has(key)) results.set(key, []);
-        const replacement = (m.replacements && m.replacements[0] && m.replacements[0].value) || null;
-        results.get(key).push({
-          message: m.shortMessage || m.message || "Deep check flagged this",
-          matchedText: text.slice(m.offset, m.offset + m.length),
-          replacement,
-          category: ltCategorize(m),
-        });
-      }
-    } catch (err) {
-      chunk.forEach(e => errors.push(`${e.key} (line ${e.line})`));
-      console.error("Deep grammar check failed for a chunk", err);
-    }
-    if (onProgress) onProgress(i + 1, chunks.length);
-  }
-  return { results, errors };
-}
-
 function parseEntries(text) {
   const lines = text.split("\n");
   const entries = [];
@@ -917,11 +733,7 @@ function parseEntries(text) {
 const HEADERS_ISSUE = ["Line", "Resource Key", "Current Value", "Suggested Change"];
 const HEADERS_SPELLING = ["Line", "Resource Key", "Current Value", "Suggested Change", "Words To Correct"];
 
-async function buildWorkbook(filename, entries, lang, deepCheck) {
-  // `deepCheck` (optional) is the { results, errors } returned by
-  // runDeepGrammarCheck() below - only present when the user opted into
-  // the "Deep grammar check (beta)" checkbox. Left undefined/null, nothing
-  // about the default behavior changes.
+async function buildWorkbook(filename, entries, lang) {
   const spellingSupported = !NO_SPELLCHECK_SUPPORT.has(lang.code) && SPELLCHECK_DICTS[lang.code];
   let dict = null;
   let dictError = false;
@@ -932,17 +744,13 @@ async function buildWorkbook(filename, entries, lang, deepCheck) {
     customWords = await loadCustomWords();
   }
 
-  const deepCheckEnabled = !!deepCheck;
-  const headersGrammar = deepCheckEnabled ? [...HEADERS_ISSUE, "Deep Check Notes"] : HEADERS_ISSUE;
-
   const spelling = [HEADERS_SPELLING];
   const spacing = [HEADERS_ISSUE];
-  const grammar = [headersGrammar];
+  const grammar = [HEADERS_ISSUE];
   const terminology = [HEADERS_ISSUE];
   const duplicates = [["Line", "Resource Key", "Current Value", "Note"]];
   const clean = [["Line", "Resource Key", "Current Value"]];
   const seenKeys = {};
-  let deepCheckIssueCount = 0;
 
   entries.forEach(e => {
     const { corrected: structFixed, notes } = structuralFix(e.value, lang.code, getMixedCaseCustomWords(), customWords);
@@ -970,44 +778,6 @@ async function buildWorkbook(filename, entries, lang, deepCheck) {
     const grammarNotes = notes.filter(n => n.startsWith("Grammar"));
     const termNotes = notes.filter(n => n.startsWith("Terminology"));
 
-    // Deep-check (beta) findings for this exact string, if the caller
-    // opted in. `ltCategorize` already sorted each match into Spelling or
-    // Grammar - folded into the same counts/routing as everything else so
-    // a deep-check-only finding still lands the row on the right sheet.
-    // See runDeepGrammarCheck() for how these are gathered.
-    //
-    // BUG FIX (2026-08-27, round 6): a deep-check replacement is NO LONGER
-    // auto-applied into "Suggested Change". MRG's real reported example:
-    // "Failed to load labels pending for confirmation" came back as
-    // "Failed to lad labels..." - LanguageTool (with the beta box checked)
-    // flagged "load" and its top suggestion was "lad", which got silently
-    // substituted straight into Suggested Change with no sanity check at
-    // all. Every OTHER suggestion source in this file (raw hunspell/typo-js
-    // suggestions) is gated by isConfidentSuggestion/_is_confident before
-    // being auto-applied - this was the one path that had no gate
-    // whatsoever, and it directly violates this project's own standing
-    // rule (CLAUDE.md Requirement #2): "Auto-fix simultaneously where
-    // safe; suggestions must always be reviewable, never blindly applied."
-    // A third-party service's suggestion can't be verified safe the way a
-    // curated exact-match table can. Also, the substitution itself used an
-    // unanchored `fullyCorrected.replace(matchedText, replacement)` -
-    // first-occurrence substring replace, not tied to the actual offset
-    // LanguageTool reported - a second, independent fragility on top of
-    // the missing confidence gate. Fix: deep-check findings are still
-    // fully surfaced (folded into routing/counts, and every match's
-    // "[matched text] -> [suggestion]: message" shown in the Spelling
-    // "Words To Correct" / Grammar "Deep Check Notes" column) but never
-    // silently written into "Suggested Change" - same as how a
-    // low-confidence dictionary guess is shown but not auto-applied.
-    const ltMatches = deepCheckEnabled ? (deepCheck.results.get(`${e.key}:${e.line}`) || []) : [];
-    const ltSpellingMatches = ltMatches.filter(m => m.category === "Spelling");
-    const ltGrammarMatches = ltMatches.filter(m => m.category === "Grammar");
-    deepCheckIssueCount += ltMatches.length;
-    function formatLtNote(m) {
-      return (m.matchedText && m.replacement)
-        ? `"${m.matchedText}" → "${m.replacement}": ${m.message}`
-        : m.message;
-    }
     // Each string lands in exactly ONE sheet - the single best-fitting
     // category - rather than being duplicated into every sheet whose check
     // found something. Which sheet wins: whichever category has the MOST
@@ -1018,8 +788,8 @@ async function buildWorkbook(filename, entries, lang, deepCheck) {
     // specified a preferred tie-break; flag if a different one is wanted).
     // Keep this in sync with _pick_category() in core/excel_report.py.
     const categoryCounts = {
-      Spelling: spellIssues.length + ltSpellingMatches.length,
-      Grammar: grammarNotes.length + ltGrammarMatches.length,
+      Spelling: spellIssues.length,
+      Grammar: grammarNotes.length,
       Terminology: termNotes.length,
       Spacing: spacingNotes.length,
     };
@@ -1033,12 +803,10 @@ async function buildWorkbook(filename, entries, lang, deepCheck) {
       const wordsCol = spellIssues.map(iss => {
         const alt = iss.alternatives.length ? ` (or: ${iss.alternatives.join(", ")})` : "";
         return iss.best ? `"${iss.word}" → "${iss.best}"${alt}` : `"${iss.word}" - no confident suggestion`;
-      }).concat(ltSpellingMatches.map(m => `[deep check, not auto-applied] ${formatLtNote(m)}`)).join(";  ");
+      }).join(";  ");
       spelling.push([e.line, e.key, e.value, fullyCorrected, wordsCol]);
     } else if (chosenCategory === "Grammar") {
-      const row = [e.line, e.key, e.value, fullyCorrected];
-      if (deepCheckEnabled) row.push(ltGrammarMatches.map(m => `[not auto-applied] ${formatLtNote(m)}`).join(";  "));
-      grammar.push(row);
+      grammar.push([e.line, e.key, e.value, fullyCorrected]);
     } else if (chosenCategory === "Terminology") {
       terminology.push([e.line, e.key, e.value, fullyCorrected]);
     } else if (chosenCategory === "Spacing") {
@@ -1053,7 +821,7 @@ async function buildWorkbook(filename, entries, lang, deepCheck) {
       seenKeys[e.key] = e.line;
     }
 
-    const hasAnyIssue = spellIssues.length > 0 || notes.length > 0 || ltMatches.length > 0;
+    const hasAnyIssue = spellIssues.length > 0 || notes.length > 0;
     if (!hasAnyIssue && !isDup) clean.push([e.line, e.key, e.value]);
   });
 
@@ -1070,13 +838,7 @@ async function buildWorkbook(filename, entries, lang, deepCheck) {
     ["Duplicate keys", duplicates.length - 1],
     ["Clean strings", clean.length - 1],
     ["Spelling dictionary used", dict ? `Yes (${SPELLCHECK_DICTS[lang.code].code})` : (dictError ? "FAILED TO LOAD - spelling not checked" : "Not supported for this language - spelling not checked")],
-    ["Deep grammar check (beta)", deepCheckEnabled
-      ? `Yes - ${deepCheckIssueCount} additional issue(s) found via languagetool.org` + (deepCheck.errors.length ? `; ${deepCheck.errors.length} string(s) could not be checked (see below)` : "")
-      : "Not used for this run"],
   ];
-  if (deepCheckEnabled && deepCheck.errors.length) {
-    summary.push(["Deep check - strings not checked", deepCheck.errors.join(", ")]);
-  }
 
   const wb = XLSX.utils.book_new();
   XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet(summary), "Summary");
@@ -1123,19 +885,10 @@ dropzone.addEventListener("drop", (e) => {
   if (file) { fileInput.files = e.dataTransfer.files; handleFileSelected(file); }
 });
 
-const deepCheckToggle = document.getElementById("deepCheckToggle");
-deepCheckToggle.addEventListener("change", () => {
-  document.getElementById("deepCheckNote").style.display = deepCheckToggle.checked ? "block" : "none";
-  document.getElementById("privacyNote").textContent = deepCheckToggle.checked
-    ? "Runs in your browser. Deep grammar check is ON - this file's text will also be sent to languagetool.org."
-    : "Runs 100% in your browser. Your file is never uploaded anywhere.";
-});
-
 document.getElementById("runBtn").addEventListener("click", async () => {
   const manual = document.getElementById("langSelect").value;
   const statusEl = document.getElementById("statusMsg");
   const runBtn = document.getElementById("runBtn");
-  const deepCheckEnabled = deepCheckToggle.checked;
   runBtn.disabled = true;
   statusEl.className = "status";
   statusEl.textContent = "Checking...";
@@ -1145,34 +898,14 @@ document.getElementById("runBtn").addEventListener("click", async () => {
     const entries = parseEntries(evt.target.result);
     const lang = manual === "auto" ? detectLanguage(currentFile.name) : { code: manual, name: KNOWN_LANG_CODES[manual] || manual, method: "manual" };
 
-    let deepCheck = null;
-    if (deepCheckEnabled) {
-      try {
-        deepCheck = await runDeepGrammarCheck(entries, (done, total) => {
-          statusEl.textContent = `Deep grammar check: batch ${done} of ${total}...`;
-        });
-      } catch (err) {
-        console.error("Deep grammar check unavailable", err);
-        statusEl.className = "status error";
-        statusEl.textContent = "Deep grammar check could not run (network issue?) - continuing with the standard checks only.";
-        deepCheck = null;
-      }
-    }
-
-    const deepCheckFailedMsg = deepCheckEnabled && !deepCheck
-      ? "Deep grammar check could not run (network issue?) - standard checks ran normally. "
-      : "";
-    const { wb, dictError, spellingSupported, stats } = await buildWorkbook(currentFile.name, entries, lang, deepCheck);
+    const { wb, dictError, spellingSupported, stats } = await buildWorkbook(currentFile.name, entries, lang);
 
     if (NO_SPELLCHECK_SUPPORT.has(lang.code)) {
       statusEl.className = "status error";
-      statusEl.textContent = deepCheckFailedMsg + `Note: dictionary spelling check is not supported for ${lang.name} - Spelling sheet will be empty. Other checks still ran.`;
+      statusEl.textContent = `Note: dictionary spelling check is not supported for ${lang.name} - Spelling sheet will be empty. Other checks still ran.`;
     } else if (dictError) {
       statusEl.className = "status error";
-      statusEl.textContent = deepCheckFailedMsg + `Note: spelling dictionary failed to load (check your internet connection) - Spelling sheet is empty this run.`;
-    } else if (deepCheckFailedMsg) {
-      statusEl.className = "status error";
-      statusEl.textContent = deepCheckFailedMsg;
+      statusEl.textContent = `Note: spelling dictionary failed to load (check your internet connection) - Spelling sheet is empty this run.`;
     } else {
       statusEl.textContent = "";
     }

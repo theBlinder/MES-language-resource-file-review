@@ -175,7 +175,7 @@ KNOWN_TYPO_FIXES = {
     # explicitly REVERSED by MRG the same day: "let atleast be atleast do
     # not split that into 2 words." "atleast" is now instead added to
     # custom_dictionary.txt, which suppresses it from being flagged at all
-    # - see Section 4 of CLAUDE.md. Do not re-add a fix for this word
+    # - see Section 4 of PROJECT_ARCHIVE.md. Do not re-add a fix for this word
     # without a new, explicit instruction from MRG.
 }
 
