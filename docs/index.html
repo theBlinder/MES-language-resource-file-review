@@ -164,9 +164,16 @@
       </select>
     </label>
     <div class="langnote" id="langNote"></div>
+
+    <label class="row">
+      <input type="checkbox" id="deepCheckToggle" style="width:auto;margin-right:6px;">
+      Deep grammar check (beta) - catches context errors no dictionary can (e.g. wrong verb forms)
+    </label>
+    <div class="langnote" id="deepCheckNote" style="display:none;">Sends this file's text to an external grammar service (languagetool.org), one file at a time. Slower - large files are checked in paced batches to respect that service's usage limits.</div>
+
     <button id="runBtn" disabled>Run QA check</button>
     <div class="status" id="statusMsg"></div>
-    <div class="privacy">Runs 100% in your browser. Your file is never uploaded anywhere.</div>
+    <div class="privacy" id="privacyNote">Runs 100% in your browser. Your file is never uploaded anywhere.</div>
   </div>
 
   <div id="results">
@@ -212,21 +219,40 @@ function detectLanguage(filename) {
 // ---- Dictionary loading (bundled Hunspell files, same-origin - no external CDN dependency) ----
 const dictCache = {};
 let customWordsCache = null;
+// Original-case custom-dictionary entries that mix upper/lower letters in a
+// specific, meaningful way (e.g. "iPAS", "HCode", "macOS") - these need
+// their EXACT casing preserved even at the start of a sentence, where the
+// generic capitalize-sentence-start fix would otherwise blindly uppercase
+// just the first letter and corrupt them ("iPAS" -> "IPAS"). Found via
+// MRG's explicit "leave iPAS as is" instruction, 2026-08-25. Keep in sync
+// with get_mixed_case_custom_words() in core/spellcheck.py.
+let mixedCaseCustomWordsCache = null;
 
 async function loadCustomWords() {
   if (customWordsCache) return customWordsCache;
   try {
     const resp = await fetch(CUSTOM_DICT_URL);
-    if (!resp.ok) { customWordsCache = new Set(); return customWordsCache; }
+    if (!resp.ok) {
+      customWordsCache = new Set();
+      mixedCaseCustomWordsCache = new Set();
+      return customWordsCache;
+    }
     const text = await resp.text();
-    customWordsCache = new Set(
-      text.split("\n").map(l => l.trim().toLowerCase()).filter(l => l && !l.startsWith("#"))
+    const lines = text.split("\n").map(l => l.trim()).filter(l => l && !l.startsWith("#"));
+    customWordsCache = new Set(lines.map(l => l.toLowerCase()));
+    mixedCaseCustomWordsCache = new Set(
+      lines.filter(l => l !== l.toLowerCase() && l !== l.toUpperCase())
     );
   } catch (err) {
     console.error("Custom dictionary load failed", err);
     customWordsCache = new Set();
+    mixedCaseCustomWordsCache = new Set();
   }
   return customWordsCache;
+}
+
+function getMixedCaseCustomWords() {
+  return mixedCaseCustomWordsCache || new Set();
 }
 
 async function loadDictionary(langCode) {
@@ -329,6 +355,43 @@ const CONTRACTION_FIXES = {
   // "were" deliberately excluded - real standalone word, not always a typo.
 };
 
+// Exact-typo -> definitely-correct-fix overrides, for cases where BOTH
+// dictionary engines' automatic suggestion ranking gets it wrong (verified
+// 2026-08-25, MRG's real reports). Same discipline as CONTRACTION_FIXES and
+// REAL_WORD_TYPO_FIXES below - exact match only, one curated entry per
+// specific reported case, never a general re-ranking heuristic. IMPORTANT:
+// typo-js (this file, the actual website) and hunspell (Python) do NOT
+// always agree on ranking for the same typo - "falied" ranks "Failed"
+// first in hunspell but "flied" first here (see the long-standing comment
+// on rerankSuggestions below, which already predicted this exact residual
+// risk). Keep this table in sync with the same-named table in
+// core/spellcheck.py.
+const KNOWN_TYPO_FIXES = {
+  falied: "failed",
+  // NOTE: "atleast" -> "at least" was here (2026-08-27 round 3) but was
+  // explicitly REVERSED by MRG the same day: "let atleast be atleast do
+  // not split that into 2 words." "atleast" is now instead in
+  // custom_dictionary.txt, which suppresses it from being flagged at all.
+  // Do not re-add a fix for this word without a new, explicit instruction.
+};
+
+// Real, standard, CORRECTLY spelled English words that our bundled en_US
+// dictionary doesn't recognize purely because they're a different regional
+// spelling (British/Commonwealth vs. American) - NOT domain jargon, and
+// deliberately NOT in custom_dictionary.txt, which is reserved for words
+// that genuinely aren't standard English at all. MRG was explicit about
+// this distinction (2026-08-27): "cancelled ... is a real English word
+// right, try to put it in the proper way" - objecting specifically to it
+// being lumped in with domain-jargon custom words. Treated as already
+// fully correct - never flagged, never "corrected" to the American
+// spelling. Keep in sync with the same-named set in core/spellcheck.py -
+// see that file for the full root-cause writeup (typo-js's/hunspell's own
+// word-splitter intercepts "cancelled" before a real suggestion is ever
+// consulted).
+const ACCEPTED_SPELLING_VARIANTS = new Set([
+  "cancelled",
+]);
+
 // "Real word, but almost certainly the WRONG real word in this context" -
 // these pass typo-js's check cleanly (valid dictionary words), so the normal
 // misspelling gate never looks at them. Found via a real reported example
@@ -341,6 +404,12 @@ const CONTRACTION_FIXES = {
 // REAL_WORD_TYPO_FIXES in core/spellcheck.py.
 const REAL_WORD_TYPO_FIXES = {
   caned: "canned",
+  // MRG's real reported example (2026-08-27): "...BOM, pleas check" -
+  // "pleas" (plural of "plea", a real dictionary word) is clearly meant to
+  // be "please" in this context. Same discipline as "caned" above - one
+  // curated entry for one specific, verified case. Keep in sync with
+  // REAL_WORD_TYPO_FIXES in core/spellcheck.py.
+  pleas: "please",
 };
 
 function trySplitCamelCase(word, dict) {
@@ -363,15 +432,27 @@ function tryLowercaseCompoundSplit(word, dict) {
   return null;
 }
 
+// Replace [placeholder] spans with same-length '#' filler so nothing inside
+// them is ever extracted as a checkable word - resource strings use [XXX],
+// [BinCode], etc. for real values substituted in at runtime; these are not
+// English text and must never be spell-checked or "corrected" (found via
+// MRG's report, 2026-08-25). Same-length filler keeps every OTHER word's
+// character position in the string unchanged. Keep in sync with
+// _mask_brackets in core/spellcheck.py.
+function maskBrackets(value) {
+  return value.replace(/\[[^\]]*\]/g, m => "#".repeat(m.length));
+}
+
 function spellCheckValue(value, dict, customWords) {
   if (!dict) return { issues: [], corrected: value };
-  const words = extractWords(value);
+  const words = extractWords(maskBrackets(value));
   const issues = [];
   let corrected = value;
   // Every word checked independently - a sentence with 2+ misspellings gets
   // BOTH corrected and BOTH listed, not just the first one found.
   for (const w of words) {
     if (matchesCustomWord(w.toLowerCase(), customWords)) continue;  // known domain term (or inflected form) - not a misspelling
+    if (ACCEPTED_SPELLING_VARIANTS.has(w.toLowerCase())) continue;  // standard English, just a different regional spelling
     const realWordFix = REAL_WORD_TYPO_FIXES[w.toLowerCase()];
     if (realWordFix) {
       // Checked BEFORE dict.check() on purpose: these are valid dictionary
@@ -383,13 +464,13 @@ function spellCheckValue(value, dict, customWords) {
       continue;
     }
     if (!dict.check(w)) {
-      const contraction = CONTRACTION_FIXES[w.toLowerCase()];
-      if (contraction) {
-        // Known missing-apostrophe contraction - use directly, skip
-        // typo-js's raw suggestions (unreliable for this exact typo class).
-        issues.push({ word: w, best: contraction, confident: true, alternatives: [] });
+      const knownFix = CONTRACTION_FIXES[w.toLowerCase()] || KNOWN_TYPO_FIXES[w.toLowerCase()];
+      if (knownFix) {
+        // Known contraction or hand-verified typo - use directly, skip
+        // typo-js's raw suggestions (unreliable for these exact typo classes).
+        issues.push({ word: w, best: knownFix, confident: true, alternatives: [] });
         const re = new RegExp(`\\b${w.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\b`);
-        corrected = corrected.replace(re, contraction);
+        corrected = corrected.replace(re, matchCase(w, knownFix));
         continue;
       }
       const camelSplit = trySplitCamelCase(w, dict);
@@ -424,7 +505,9 @@ function spellCheckValue(value, dict, customWords) {
 }
 
 // ---- Structural checks (spacing/grammar/terminology) - language-aware, always run ----
-function structuralFix(value, lang) {
+function structuralFix(value, lang, mixedCaseWords, customWordsForCasing) {
+  mixedCaseWords = mixedCaseWords || new Set();
+  customWordsForCasing = customWordsForCasing || new Set();
   const cats = [];
   let v = value;
 
@@ -493,8 +576,16 @@ function structuralFix(value, lang) {
   const deperiod = v.replace(/\.\.(?!\.)/g, ".");
   if (deperiod !== v) { cats.push("Grammar: fixed double period"); v = deperiod; }
 
+  // Don't blindly uppercase the first letter if the first word is a
+  // custom-dictionary term with deliberate internal casing (e.g. "iPAS",
+  // "macOS") - doing so corrupts it (e.g. "iPAS" -> "IPAS"). Found via
+  // MRG's explicit "leave iPAS as is" instruction, 2026-08-25. Keep in
+  // sync with the same skip in core/engine.py's fix_value.
+  const firstWordMatch = v.match(/^[A-Za-z][A-Za-z0-9']*/);
+  const firstWordProtected = firstWordMatch && mixedCaseWords.has(firstWordMatch[0]);
+
   const looksLikeSentence = v.split(/\s+/).filter(Boolean).length >= 3 || /[.!?:]\s*$/.test(v);
-  if (v && looksLikeSentence && /^[a-z]/.test(v) && (lang === "en" || lang === "unknown")) {
+  if (v && looksLikeSentence && /^[a-z]/.test(v) && (lang === "en" || lang === "unknown") && !firstWordProtected) {
     // Still apply the mechanical fix (so "Suggested Change" is correctly
     // capitalized) regardless of why v currently starts lowercase - but only
     // COUNT it as a Grammar issue for sheet-routing purposes if the ORIGINAL
@@ -512,11 +603,12 @@ function structuralFix(value, lang) {
     }
   }
 
-  // Detect (but do not auto-fix - direction is ambiguous) a string mixing
-  // Title Case and sentence case internally. Skipped for multi-sentence
-  // strings, where a capital after ". " is correct, not inconsistent.
+  // Detect AND fix (fix added 2026-08-27 per MRG's explicit "Broader fix"
+  // choice - was detect-only before that) a string mixing Title Case and
+  // sentence case internally. Skipped for multi-sentence strings, where a
+  // capital after ". " is correct, not inconsistent.
   //
-  // IMPORTANT: this checks the ORIGINAL `value` parameter, not the
+  // IMPORTANT: detection checks the ORIGINAL `value` parameter, not the
   // progressively-fixed `v` - fixed 2026-08-25. An earlier fix in this same
   // pipeline (the comma-continuation decap step, a few lines up) can lower
   // a word like "Please" to "please" BEFORE this check ever runs, which
@@ -528,6 +620,15 @@ function structuralFix(value, lang) {
   // this note could tip a string away from Grammar into a different sheet
   // entirely. The Python side never had this problem (`check_entry` always
   // evaluates against the untouched original value); this mirrors that.
+  //
+  // Once detected, the FIX (mirrors _fix_mixed_case_casing in
+  // core/engine.py) lowercases every wrongly-capitalized content word
+  // after the first one, treating sentence case as the target - skipping
+  // custom-dictionary and glossary-protected words (IDH, Vegam, HCode,
+  // iPAS, DRL, etc.) so they're never silently changed. Gated behind the
+  // SAME conservative detection above, so a short intentional Title-Case
+  // label like "Please Confirm" never reaches this code (too few content
+  // words, or no actual mix).
   if (lang === "en" || lang === "unknown") {
     const MINOR_WORDS = new Set(["of","the","a","an","in","to","and","or","is","are","was","were","by","on","at","as","per","vs","nor","but","for"]);
     const hasMultipleSentences = /[.!?]\s+[A-Z]/.test(value);
@@ -537,7 +638,25 @@ function structuralFix(value, lang) {
       const rest = contentWords.slice(1);
       const hasCap = rest.some(w => /^[A-Z]/.test(w) && w !== w.toUpperCase());
       const hasLower = rest.some(w => /^[a-z]/.test(w));
-      if (hasCap && hasLower) cats.push("Grammar: inconsistent capitalization (mixes Title Case and sentence case)");
+      if (hasCap && hasLower) {
+        cats.push("Grammar: inconsistent capitalization (mixes Title Case and sentence case)");
+        const protectedWords = new Set([
+          ...Object.keys(GLOSSARY),
+          ...Object.values(GLOSSARY).map(x => String(x).toLowerCase()),
+        ]);
+        let seenFirstContentWord = false;
+        v = v.replace(/[A-Za-z']+/g, (word) => {
+          if (MINOR_WORDS.has(word.toLowerCase()) || word.length <= 1) return word;
+          if (!seenFirstContentWord) { seenFirstContentWord = true; return word; }
+          if (mixedCaseWords.has(word) || (customWordsForCasing && matchesCustomWord(word.toLowerCase(), customWordsForCasing)) || protectedWords.has(word.toLowerCase())) {
+            return word;
+          }
+          if (/^[A-Z]/.test(word) && word !== word.toUpperCase()) {
+            return word[0].toLowerCase() + word.slice(1);
+          }
+          return word;
+        });
+      }
     }
   }
 
@@ -564,6 +683,184 @@ function structuralFix(value, lang) {
   return { corrected: v, notes: cats };
 }
 
+// ---- Optional "Deep Grammar Check" (opt-in, beta, added 2026-08-27) ----
+// Calls the free PUBLIC LanguageTool API (https://api.languagetool.org) -
+// this is NOT self-hosted and NOT part of the default 100%-local flow.
+// Off by default; MRG explicitly asked for real-time/context-aware
+// checking given the earlier dictionary/regex-only checks can't catch
+// context-dependent grammar errors (e.g. "want to unselected" - a validly
+// spelled but grammatically wrong verb form; see Open Item #4 in
+// CLAUDE.md). This is deliberately OPT-IN and PACED, never automatic on
+// every check: the free API's own documented terms say "do not send
+// automated requests" and cap usage at 20 requests/IP/minute, 75KB
+// text/IP/minute, 20KB text/request (dev.languagetool.org/public-http-api,
+// checked 2026-08-27) - a whole-company tool silently calling this on
+// every file load for every one of 400-500 files would very likely get
+// Vegam's office IP rate-limited or blocked. So: manual checkbox, one file
+// at a time, requests kept comfortably under those limits with a delay
+// between chunks.
+//
+// IMPORTANT / UNVERIFIED: this specific external call could NOT be
+// live-tested from the sandbox this was built in (its network egress does
+// not reach languagetool.org) - the request/response shape below is built
+// from LanguageTool's own documented API contract (endpoint, `text` +
+// `language` params, `matches[].offset/length/message/shortMessage/
+// replacements/rule.category`), not confirmed against a real live
+// response. MUST be tested against the real site (which has normal
+// internet access) before relying on it - if the response shape has
+// changed since this was written, this will fail loudly (network/parse
+// error surfaced per string, see runDeepGrammarCheck's error handling)
+// rather than silently doing nothing.
+const LT_ENDPOINT = "https://api.languagetool.org/v2/check";
+const LT_MAX_CHARS_PER_REQUEST = 15000; // documented cap is 20KB/request - leave headroom
+const LT_REQUESTS_PER_MINUTE = 15;      // documented cap is 20/minute - leave headroom
+const LT_RATE_WINDOW_MS = 60000;
+const LT_RATE_LOG_KEY = "locQaTool_ltRequestLog";
+
+function ltCategorize(match) {
+  const issueType = (match.rule && (match.rule.issueType || (match.rule.category && match.rule.category.id))) || "";
+  return /typo|misspelling/i.test(issueType) ? "Spelling" : "Grammar";
+}
+
+// Keeps this browser under LT_REQUESTS_PER_MINUTE across the ROLLING LAST
+// MINUTE - not just within one file's own chunk loop. Added 2026-08-27
+// after MRG asked what happens if someone runs 20+ files within an hour:
+// the original version only paced requests WITHIN a single
+// runDeepGrammarCheck() call, so running several files back-to-back (or
+// reloading the page and starting another file right away) had no memory
+// of what was already sent and could exceed the free API's limit on its
+// own. Fix: persist each request's timestamp in localStorage (survives
+// across separate file runs and page reloads, but is scoped to THIS
+// browser only - see the important caveat below) and, before every
+// request, wait however long is needed to stay at or under the limit.
+//
+// IMPORTANT CAVEAT: LanguageTool's free-tier limit is per-IP, not
+// per-browser. This only coordinates requests from one person's own
+// browser. If several Vegam employees are checking files around the same
+// time from behind the same office network (so they all look like one IP
+// to LanguageTool), each person's browser has no way to know what anyone
+// else's browser is doing - localStorage is never shared between
+// different people's machines, and this is a backend-less static site so
+// there's nowhere to keep a shared counter. In that scenario the SHARED
+// limit could still be hit even though each individual browser is pacing
+// itself correctly. That's not a crash - see runDeepGrammarCheck's error
+// handling below - a request that gets rate-limited (HTTP 429) is simply
+// treated as "not checked" for those specific strings, same as a network
+// failure. If this turns out to matter in practice (busy periods, many
+// people checking files at once), the real fix is a LanguageTool
+// Enterprise/paid key (removes the shared limit) rather than more
+// client-side pacing, which can't see across different people's browsers.
+function ltWaitForRateLimit() {
+  let log;
+  try {
+    log = JSON.parse(localStorage.getItem(LT_RATE_LOG_KEY) || "[]");
+    if (!Array.isArray(log)) log = [];
+  } catch (err) {
+    // localStorage unavailable (private browsing, disabled, quota, etc.) -
+    // fall back to no persistent pacing rather than crashing the check.
+    return Promise.resolve();
+  }
+  const now = Date.now();
+  log = log.filter(t => now - t < LT_RATE_WINDOW_MS);
+  const wait = log.length >= LT_REQUESTS_PER_MINUTE
+    ? Math.max(0, LT_RATE_WINDOW_MS - (now - log[0]) + 250) // +250ms safety margin
+    : 0;
+  const record = () => {
+    try {
+      const freshNow = Date.now();
+      const fresh = log.filter(t => freshNow - t < LT_RATE_WINDOW_MS);
+      fresh.push(freshNow);
+      localStorage.setItem(LT_RATE_LOG_KEY, JSON.stringify(fresh));
+    } catch (err) { /* ignore - see comment above */ }
+  };
+  if (wait <= 0) { record(); return Promise.resolve(); }
+  return new Promise(resolve => setTimeout(() => { record(); resolve(); }, wait));
+}
+
+// One HTTP call. `text` may contain multiple resource strings joined by
+// "\n" (LanguageTool treats each line as its own sentence context).
+// Returns the raw `matches` array from LanguageTool's response. Always
+// waits for ltWaitForRateLimit() first - see that function for why this
+// needs to persist across separate calls, not just pace within one loop.
+async function ltCheckBatch(text) {
+  await ltWaitForRateLimit();
+  const body = new URLSearchParams({ text, language: "en-US" });
+  const resp = await fetch(LT_ENDPOINT, {
+    method: "POST",
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    body,
+  });
+  if (!resp.ok) {
+    throw new Error(`LanguageTool request failed: HTTP ${resp.status}`);
+  }
+  const data = await resp.json();
+  return data.matches || [];
+}
+
+// Splits `entries` into request-sized chunks (respecting
+// LT_MAX_CHARS_PER_REQUEST), calls the API once per chunk - each call
+// paced by ltCheckBatch()'s built-in rate-limit wait, which persists
+// across chunks AND across separate runDeepGrammarCheck() calls (separate
+// file runs) - and maps each match back to the specific entry it belongs
+// to via character offset into the chunk's combined text.
+// onProgress(doneChunks, totalChunks) fires after each chunk - this can be
+// a slow, deliberately-paced, multi-request operation for a large file.
+// Returns { results, errors } - results: Map("key:line" -> [{message,
+// matchedText, replacement, category}]); errors: array of "key:line"
+// strings whose chunk failed (network error, rate-limited, etc.) - treated
+// as "not checked", same discipline as every other "dictionary not
+// available" case in this project, never silently as "clean".
+async function runDeepGrammarCheck(entries, onProgress) {
+  const results = new Map();
+  const errors = [];
+  const chunks = [];
+  let current = [];
+  let currentLen = 0;
+  for (const e of entries) {
+    const lineLen = e.value.length + 1; // +1 for the joining newline
+    if (currentLen + lineLen > LT_MAX_CHARS_PER_REQUEST && current.length) {
+      chunks.push(current);
+      current = [];
+      currentLen = 0;
+    }
+    current.push(e);
+    currentLen += lineLen;
+  }
+  if (current.length) chunks.push(current);
+
+  for (let i = 0; i < chunks.length; i++) {
+    const chunk = chunks[i];
+    const text = chunk.map(e => e.value).join("\n");
+    const offsets = [];
+    let pos = 0;
+    for (const e of chunk) {
+      offsets.push({ start: pos, end: pos + e.value.length, entry: e });
+      pos += e.value.length + 1;
+    }
+    try {
+      const matches = await ltCheckBatch(text);
+      for (const m of matches) {
+        const owner = offsets.find(o => m.offset >= o.start && m.offset < o.end);
+        if (!owner) continue; // landed on the joining newline itself - skip
+        const key = `${owner.entry.key}:${owner.entry.line}`;
+        if (!results.has(key)) results.set(key, []);
+        const replacement = (m.replacements && m.replacements[0] && m.replacements[0].value) || null;
+        results.get(key).push({
+          message: m.shortMessage || m.message || "Deep check flagged this",
+          matchedText: text.slice(m.offset, m.offset + m.length),
+          replacement,
+          category: ltCategorize(m),
+        });
+      }
+    } catch (err) {
+      chunk.forEach(e => errors.push(`${e.key} (line ${e.line})`));
+      console.error("Deep grammar check failed for a chunk", err);
+    }
+    if (onProgress) onProgress(i + 1, chunks.length);
+  }
+  return { results, errors };
+}
+
 function parseEntries(text) {
   const lines = text.split("\n");
   const entries = [];
@@ -577,7 +874,11 @@ function parseEntries(text) {
 const HEADERS_ISSUE = ["Line", "Resource Key", "Current Value", "Suggested Change"];
 const HEADERS_SPELLING = ["Line", "Resource Key", "Current Value", "Suggested Change", "Words To Correct"];
 
-async function buildWorkbook(filename, entries, lang) {
+async function buildWorkbook(filename, entries, lang, deepCheck) {
+  // `deepCheck` (optional) is the { results, errors } returned by
+  // runDeepGrammarCheck() below - only present when the user opted into
+  // the "Deep grammar check (beta)" checkbox. Left undefined/null, nothing
+  // about the default behavior changes.
   const spellingSupported = !NO_SPELLCHECK_SUPPORT.has(lang.code) && SPELLCHECK_DICTS[lang.code];
   let dict = null;
   let dictError = false;
@@ -588,16 +889,20 @@ async function buildWorkbook(filename, entries, lang) {
     customWords = await loadCustomWords();
   }
 
+  const deepCheckEnabled = !!deepCheck;
+  const headersGrammar = deepCheckEnabled ? [...HEADERS_ISSUE, "Deep Check Notes"] : HEADERS_ISSUE;
+
   const spelling = [HEADERS_SPELLING];
   const spacing = [HEADERS_ISSUE];
-  const grammar = [HEADERS_ISSUE];
+  const grammar = [headersGrammar];
   const terminology = [HEADERS_ISSUE];
   const duplicates = [["Line", "Resource Key", "Current Value", "Note"]];
   const clean = [["Line", "Resource Key", "Current Value"]];
   const seenKeys = {};
+  let deepCheckIssueCount = 0;
 
   entries.forEach(e => {
-    const { corrected: structFixed, notes } = structuralFix(e.value, lang.code);
+    const { corrected: structFixed, notes } = structuralFix(e.value, lang.code, getMixedCaseCustomWords(), customWords);
 
     let spellIssues = [];
     let fullyCorrected = structFixed;
@@ -622,6 +927,28 @@ async function buildWorkbook(filename, entries, lang) {
     const grammarNotes = notes.filter(n => n.startsWith("Grammar"));
     const termNotes = notes.filter(n => n.startsWith("Terminology"));
 
+    // Deep-check (beta) findings for this exact string, if the caller
+    // opted in. `ltCategorize` already sorted each match into Spelling or
+    // Grammar - folded into the same counts/routing as everything else so
+    // a deep-check-only finding still lands the row on the right sheet,
+    // and (when it offers a replacement) into the same "Suggested Change"
+    // text, same as every other check. See runDeepGrammarCheck() for how
+    // these are gathered.
+    const ltMatches = deepCheckEnabled ? (deepCheck.results.get(`${e.key}:${e.line}`) || []) : [];
+    const ltSpellingMatches = ltMatches.filter(m => m.category === "Spelling");
+    const ltGrammarMatches = ltMatches.filter(m => m.category === "Grammar");
+    deepCheckIssueCount += ltMatches.length;
+    for (const m of ltGrammarMatches) {
+      if (m.matchedText && m.replacement && fullyCorrected.includes(m.matchedText)) {
+        fullyCorrected = fullyCorrected.replace(m.matchedText, m.replacement);
+      }
+    }
+    for (const m of ltSpellingMatches) {
+      if (m.matchedText && m.replacement && fullyCorrected.includes(m.matchedText)) {
+        fullyCorrected = fullyCorrected.replace(m.matchedText, m.replacement);
+      }
+    }
+
     // Each string lands in exactly ONE sheet - the single best-fitting
     // category - rather than being duplicated into every sheet whose check
     // found something. Which sheet wins: whichever category has the MOST
@@ -632,8 +959,8 @@ async function buildWorkbook(filename, entries, lang) {
     // specified a preferred tie-break; flag if a different one is wanted).
     // Keep this in sync with _pick_category() in core/excel_report.py.
     const categoryCounts = {
-      Spelling: spellIssues.length,
-      Grammar: grammarNotes.length,
+      Spelling: spellIssues.length + ltSpellingMatches.length,
+      Grammar: grammarNotes.length + ltGrammarMatches.length,
       Terminology: termNotes.length,
       Spacing: spacingNotes.length,
     };
@@ -647,10 +974,12 @@ async function buildWorkbook(filename, entries, lang) {
       const wordsCol = spellIssues.map(iss => {
         const alt = iss.alternatives.length ? ` (or: ${iss.alternatives.join(", ")})` : "";
         return iss.best ? `"${iss.word}" → "${iss.best}"${alt}` : `"${iss.word}" - no confident suggestion`;
-      }).join(";  ");
+      }).concat(ltSpellingMatches.map(m => `[deep check] ${m.message}`)).join(";  ");
       spelling.push([e.line, e.key, e.value, fullyCorrected, wordsCol]);
     } else if (chosenCategory === "Grammar") {
-      grammar.push([e.line, e.key, e.value, fullyCorrected]);
+      const row = [e.line, e.key, e.value, fullyCorrected];
+      if (deepCheckEnabled) row.push(ltGrammarMatches.map(m => m.message).join(";  "));
+      grammar.push(row);
     } else if (chosenCategory === "Terminology") {
       terminology.push([e.line, e.key, e.value, fullyCorrected]);
     } else if (chosenCategory === "Spacing") {
@@ -665,7 +994,7 @@ async function buildWorkbook(filename, entries, lang) {
       seenKeys[e.key] = e.line;
     }
 
-    const hasAnyIssue = spellIssues.length > 0 || notes.length > 0;
+    const hasAnyIssue = spellIssues.length > 0 || notes.length > 0 || ltMatches.length > 0;
     if (!hasAnyIssue && !isDup) clean.push([e.line, e.key, e.value]);
   });
 
@@ -682,7 +1011,13 @@ async function buildWorkbook(filename, entries, lang) {
     ["Duplicate keys", duplicates.length - 1],
     ["Clean strings", clean.length - 1],
     ["Spelling dictionary used", dict ? `Yes (${SPELLCHECK_DICTS[lang.code].code})` : (dictError ? "FAILED TO LOAD - spelling not checked" : "Not supported for this language - spelling not checked")],
+    ["Deep grammar check (beta)", deepCheckEnabled
+      ? `Yes - ${deepCheckIssueCount} additional issue(s) found via languagetool.org` + (deepCheck.errors.length ? `; ${deepCheck.errors.length} string(s) could not be checked (see below)` : "")
+      : "Not used for this run"],
   ];
+  if (deepCheckEnabled && deepCheck.errors.length) {
+    summary.push(["Deep check - strings not checked", deepCheck.errors.join(", ")]);
+  }
 
   const wb = XLSX.utils.book_new();
   XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet(summary), "Summary");
@@ -729,10 +1064,19 @@ dropzone.addEventListener("drop", (e) => {
   if (file) { fileInput.files = e.dataTransfer.files; handleFileSelected(file); }
 });
 
+const deepCheckToggle = document.getElementById("deepCheckToggle");
+deepCheckToggle.addEventListener("change", () => {
+  document.getElementById("deepCheckNote").style.display = deepCheckToggle.checked ? "block" : "none";
+  document.getElementById("privacyNote").textContent = deepCheckToggle.checked
+    ? "Runs in your browser. Deep grammar check is ON - this file's text will also be sent to languagetool.org."
+    : "Runs 100% in your browser. Your file is never uploaded anywhere.";
+});
+
 document.getElementById("runBtn").addEventListener("click", async () => {
   const manual = document.getElementById("langSelect").value;
   const statusEl = document.getElementById("statusMsg");
   const runBtn = document.getElementById("runBtn");
+  const deepCheckEnabled = deepCheckToggle.checked;
   runBtn.disabled = true;
   statusEl.className = "status";
   statusEl.textContent = "Checking...";
@@ -742,14 +1086,34 @@ document.getElementById("runBtn").addEventListener("click", async () => {
     const entries = parseEntries(evt.target.result);
     const lang = manual === "auto" ? detectLanguage(currentFile.name) : { code: manual, name: KNOWN_LANG_CODES[manual] || manual, method: "manual" };
 
-    const { wb, dictError, spellingSupported, stats } = await buildWorkbook(currentFile.name, entries, lang);
+    let deepCheck = null;
+    if (deepCheckEnabled) {
+      try {
+        deepCheck = await runDeepGrammarCheck(entries, (done, total) => {
+          statusEl.textContent = `Deep grammar check: batch ${done} of ${total}...`;
+        });
+      } catch (err) {
+        console.error("Deep grammar check unavailable", err);
+        statusEl.className = "status error";
+        statusEl.textContent = "Deep grammar check could not run (network issue?) - continuing with the standard checks only.";
+        deepCheck = null;
+      }
+    }
+
+    const deepCheckFailedMsg = deepCheckEnabled && !deepCheck
+      ? "Deep grammar check could not run (network issue?) - standard checks ran normally. "
+      : "";
+    const { wb, dictError, spellingSupported, stats } = await buildWorkbook(currentFile.name, entries, lang, deepCheck);
 
     if (NO_SPELLCHECK_SUPPORT.has(lang.code)) {
       statusEl.className = "status error";
-      statusEl.textContent = `Note: dictionary spelling check is not supported for ${lang.name} - Spelling sheet will be empty. Other checks still ran.`;
+      statusEl.textContent = deepCheckFailedMsg + `Note: dictionary spelling check is not supported for ${lang.name} - Spelling sheet will be empty. Other checks still ran.`;
     } else if (dictError) {
       statusEl.className = "status error";
-      statusEl.textContent = `Note: spelling dictionary failed to load (check your internet connection) - Spelling sheet is empty this run.`;
+      statusEl.textContent = deepCheckFailedMsg + `Note: spelling dictionary failed to load (check your internet connection) - Spelling sheet is empty this run.`;
+    } else if (deepCheckFailedMsg) {
+      statusEl.className = "status error";
+      statusEl.textContent = deepCheckFailedMsg;
     } else {
       statusEl.textContent = "";
     }

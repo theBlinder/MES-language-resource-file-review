@@ -109,7 +109,7 @@ def build_report(path, out_path, lang_override=None, lt_client=None):
             words_col = ";  ".join(
                 f'"{w}" -> "{s[0]}"' + (f" (or: {', '.join(s[1:3])})" if len(s) > 1 else "")
                 if s else f'"{w}" - no confident suggestion'
-                for w, s in hits
+                for w, s, _c in hits
             )
             rows_by_category["Spelling"].append([lineno, key, value, suggested, words_col])
         elif chosen_category is not None:

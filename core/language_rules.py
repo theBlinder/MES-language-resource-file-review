@@ -79,8 +79,18 @@ def check_entry(value, lang="en", glossary=None):
             issues["Grammar"].append('"No.Of" should be "No. of" (missing space, and "of" should be lowercase)')
         elif re.search(r"No\.\s*Of\b", v):
             issues["Grammar"].append('"Of" should be lowercase: "No. of", not "No. Of"')
+    # Don't flag a custom-dictionary term with deliberate internal casing
+    # (e.g. "iPAS", "macOS") as "doesn't start with a capital" just because
+    # it happens to start with a lowercase letter - that casing is correct
+    # and intentional. Must match the same skip in engine.py's fix_value,
+    # or detection and fixing disagree on whether this string has an issue.
+    from core.spellcheck import get_mixed_case_custom_words
+    first_word_match = re.match(r"[A-Za-z][A-Za-z0-9']*", v)
+    first_word = first_word_match.group(0) if first_word_match else ""
+    first_word_protected = first_word in get_mixed_case_custom_words()
+
     looks_like_sentence = len(v.split()) >= 3 or v.rstrip().endswith((".", "!", "?", ":"))
-    if v and looks_like_sentence and v[0].islower() and v[0].isalpha() and lang in ("en", "unknown"):
+    if v and looks_like_sentence and v[0].islower() and v[0].isalpha() and lang in ("en", "unknown") and not first_word_protected:
         issues["Grammar"].append("Sentence does not start with a capital letter")
 
     # A word capitalized right after a mid-sentence comma is almost always
@@ -172,7 +182,7 @@ def check_entry(value, lang="en", glossary=None):
     if spelling_hits is None:
         pass  # dictionary not available for this language - not checked, not "clean"
     else:
-        for word, suggestions in spelling_hits:
+        for word, suggestions, _confident in spelling_hits:
             suggestion_text = f' (did you mean "{suggestions[0]}"?)' if suggestions else ""
             issues["Spelling"].append(f'Possible misspelling: "{word}"{suggestion_text}')
 

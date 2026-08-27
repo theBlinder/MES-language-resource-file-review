@@ -1,7 +1,16 @@
 # Domain-specific words that are correct for this product but not in a
 # standard English dictionary. One word per line. Add to this as the
 # spelling sheet surfaces more false positives from real terminology.
+#
+# NOTE: this file is only for words that are NOT standard English (product
+# jargon, coined terms, informal concatenations MRG wants left alone as-is).
+# A real, correctly-spelled standard English word that's just a different
+# regional spelling (e.g. British "cancelled") does NOT belong here - see
+# ACCEPTED_SPELLING_VARIANTS in core/spellcheck.py / docs/index.html
+# instead. MRG was explicit about this distinction, 2026-08-27.
 preweigh
+preprocess
+prebatch
 packoff
 downtime
 workorder
@@ -13,7 +22,10 @@ kanban
 idh
 reworkable
 putaway
+atleast
 Vegam
+HCode
+iPAS
 
 # Common software/UI "toggle" verbs (un-/de-/pre-/mis- prefixed) that a
 # general English dictionary often only has the inflected form for, not the

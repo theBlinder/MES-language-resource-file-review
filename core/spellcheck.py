@@ -142,17 +142,70 @@ CONTRACTION_FIXES = {
 # entry here when it's a specific, reported, verified case.
 REAL_WORD_TYPO_FIXES = {
     "caned": "canned",
+    # MRG's real reported example (2026-08-27): "...BOM, pleas check" -
+    # "pleas" (plural of "plea", a real dictionary word) is clearly meant
+    # to be "please" in this context. Same discipline as "caned" above -
+    # one curated entry for one specific, verified case.
+    "pleas": "please",
+}
+
+# Exact-typo -> definitely-correct-fix overrides, for cases where BOTH
+# dictionary engines' automatic suggestion ranking gets it wrong (verified
+# 2026-08-25, MRG's real reports). Same discipline as CONTRACTION_FIXES and
+# REAL_WORD_TYPO_FIXES above - exact match only, one curated entry per
+# specific reported case, never a general re-ranking heuristic (Lessons 1
+# and 6). IMPORTANT: hunspell (Python) and typo-js (JS, used by the actual
+# website) do NOT always agree on ranking for the same typo - "falied" was
+# previously believed to rank "Failed" first everywhere (see the old note
+# below), but that's only true for hunspell; typo-js ranks "flied" first for
+# the exact same typo. Verify against BOTH engines before assuming either is
+# fixed, and keep this table in sync with the same-named object in
+# docs/index.html.
+KNOWN_TYPO_FIXES = {
+    "falied": "failed",
+    # NOTE: "atleast" -> "at least" was here (2026-08-27 round 3) but was
+    # explicitly REVERSED by MRG the same day: "let atleast be atleast do
+    # not split that into 2 words." "atleast" is now instead added to
+    # custom_dictionary.txt, which suppresses it from being flagged at all
+    # - see Section 4 of CLAUDE.md. Do not re-add a fix for this word
+    # without a new, explicit instruction from MRG.
+}
+
+# Real, standard, CORRECTLY spelled English words that our bundled en_US
+# dictionary doesn't recognize purely because they're a different regional
+# spelling (British/Commonwealth vs. American) - NOT domain jargon, and
+# deliberately NOT in custom_dictionary.txt, which is reserved for words
+# that genuinely aren't standard English at all (see that file's own
+# header). MRG was explicit about this distinction (2026-08-27): "cancelled
+# ... is a real English word right, try to put it in the proper way" -
+# objecting specifically to it being lumped in with domain-jargon custom
+# words. These are treated as already fully correct - never flagged, never
+# "corrected" to the American spelling. Root cause of the original bug:
+# hunspell's OWN top raw suggestion for "cancelled" is actually "canceled"
+# (verified directly) - but `_try_lowercase_compound_split` below runs
+# BEFORE raw suggestions are ever consulted, and "can" + "celled" both pass
+# as individually valid dictionary words, so the split wins first and wrong
+# ("can celled"). Rather than reordering that lookup generally (risks
+# regressing the "taginfo" -> "tag info" case, which relies on compound
+# split running first - verified directly that swapping the order broadly
+# breaks that case), this is a small, exact, curated exemption - same
+# discipline as KNOWN_TYPO_FIXES/REAL_WORD_TYPO_FIXES/CONTRACTION_FIXES.
+# Keep in sync with the same-named object in docs/index.html.
+ACCEPTED_SPELLING_VARIANTS = {
+    "cancelled",
 }
 
 
 def _rerank(word, suggestions):
-    """Real hunspell's own ranking is already good (verified: 'receipe' ->
-    'recipe' first, 'Falied' -> 'Failed' first, with no help needed) - do NOT
-    reorder by length/edit-distance, an earlier attempt at that broke
-    otherwise-correct results (e.g. reordered 'recipe' behind 'receipt').
-    Only demerit suggestions that insert a space/hyphen (e.g. 'Fa lied'),
-    which are rarely what's wanted as the top pick; keep everything else in
-    hunspell's original relative order."""
+    """Real hunspell's own ranking is USUALLY already good (verified:
+    'receipe' -> 'recipe' first) - do NOT reorder by length/edit-distance,
+    an earlier attempt at that broke otherwise-correct results (e.g.
+    reordered 'recipe' behind 'receipt'). Only demerit suggestions that
+    insert a space/hyphen (e.g. 'Fa lied'), which are rarely what's wanted
+    as the top pick; keep everything else in hunspell's original relative
+    order. For the residual cases where even this isn't enough (hunspell's
+    -or- typo-js's own top pick is just wrong), see KNOWN_TYPO_FIXES above -
+    that's checked first and skips this function entirely."""
     return sorted(suggestions, key=lambda s: 1 if (" " in s or "-" in s) else 0)
 
 
@@ -182,6 +235,36 @@ def get_custom_words(path=None):
     return _custom_words_cache
 
 
+_mixed_case_words_cache = None
+
+
+def get_mixed_case_custom_words(path=None):
+    """Original-case custom-dictionary entries that mix upper/lower letters
+    in a specific, meaningful way (e.g. 'iPAS', 'HCode', 'macOS') - these
+    need their EXACT casing preserved even at the start of a sentence, where
+    the generic 'capitalize sentence start' fix would otherwise blindly
+    uppercase just the first letter and corrupt them (e.g. 'iPAS' ->
+    'IPAS'). Only entries that are neither all-lowercase nor all-uppercase
+    qualify - plain words like 'Vegam' or 'kanban' don't need this (the
+    normal capitalize-first-letter behavior is already correct for them,
+    and shouldn't be suppressed). Found via MRG's explicit 'leave iPAS as
+    is' instruction, 2026-08-25 - iPAS starting a sentence was silently
+    becoming 'IPAS'. Keep in sync with the same-purpose set in
+    docs/index.html."""
+    global _mixed_case_words_cache
+    if _mixed_case_words_cache is None:
+        default_path = path or os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "custom_dictionary.txt")
+        words = set()
+        if os.path.exists(default_path):
+            with open(default_path, encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if line and not line.startswith("#") and not line.islower() and not line.isupper():
+                        words.add(line)
+        _mixed_case_words_cache = words
+    return _mixed_case_words_cache
+
+
 _INFLECTION_SUFFIXES = ("ing", "ed", "es", "s", "er", "ers")
 
 
@@ -198,17 +281,36 @@ def _matches_custom_word(word_lower, custom_words):
     return False
 
 
+_BRACKET_RE = re.compile(r"\[[^\]]*\]")
+
+
+def _mask_brackets(value):
+    """Replace [placeholder] spans with same-length '#' filler so nothing
+    inside them is ever extracted as a checkable word - resource strings use
+    [XXX], [BinCode], etc. for real values substituted in at runtime; these
+    are not English text and must never be spell-checked or "corrected"
+    (found via MRG's report, 2026-08-25). Same-length filler keeps every
+    OTHER word's character position in the string unchanged."""
+    return _BRACKET_RE.sub(lambda m: "#" * len(m.group(0)), value)
+
+
 def check_spelling(value, lang, custom_words=None):
-    """Returns list of (word, [suggestions]) for words not found in the dictionary
-    OR the custom word list. Skips placeholders like [XXX] and short/ALLCAPS
-    tokens (likely abbreviations)."""
+    """Returns list of (word, [suggestions], confident) for words not found
+    in the dictionary OR the custom word list. `confident` is True when the
+    top suggestion came from a deterministic, high-confidence source (a
+    known typo/contraction lookup, or a verified two-real-word split) and
+    should be trusted for auto-applying regardless of suggestion length or
+    whether it contains a space - unlike a raw dictionary suggestion, whose
+    confidence still depends on how close it is to the original word (see
+    `_is_confident` below). Skips placeholders like [XXX] (see
+    `_mask_brackets`) and short/ALLCAPS tokens (likely abbreviations)."""
     if not is_available(lang):
         return None  # explicitly "not checked", different from "no errors"
     custom_words = custom_words or set()
     lib = _load_lib()
     h = _get_handle(lang)
     results = []
-    for m in _WORD_RE.finditer(value):
+    for m in _WORD_RE.finditer(_mask_brackets(value)):
         # Strip leading/trailing quote-apostrophes used as quotation marks
         # (e.g. 'Confirm' meaning the button labeled Confirm) - but keep
         # internal apostrophes from real contractions (don't, user's).
@@ -217,36 +319,39 @@ def check_spelling(value, lang, custom_words=None):
             continue  # skip short tokens/abbreviations like "IP", "OK"
         if _matches_custom_word(word.lower(), custom_words):
             continue  # known domain term (or its inflected form) - not a misspelling
+        if word.lower() in ACCEPTED_SPELLING_VARIANTS:
+            continue  # standard English, just a different regional spelling - see ACCEPTED_SPELLING_VARIANTS above
         real_word_fix = REAL_WORD_TYPO_FIXES.get(word.lower())
         if real_word_fix:
             # Checked BEFORE the hunspell gate below, on purpose: these are
             # valid dictionary words (hunspell would say "ok" and never flag
             # them), which is exactly why a generic dictionary check can't
             # catch this class of typo. See REAL_WORD_TYPO_FIXES above.
-            results.append((word, [real_word_fix]))
+            results.append((word, [real_word_fix], True))
             continue
         ok = lib.Hunspell_spell(h, word.encode("utf-8"))
         if not ok:
-            contraction = CONTRACTION_FIXES.get(word.lower())
-            if contraction:
-                # Known missing-apostrophe contraction - use directly,
+            known_fix = CONTRACTION_FIXES.get(word.lower()) or KNOWN_TYPO_FIXES.get(word.lower())
+            if known_fix:
+                # Known contraction or hand-verified typo - use directly,
                 # skip hunspell's raw suggestions entirely (they're
-                # unreliable for exactly this typo class, see note above).
-                results.append((word, [contraction]))
+                # unreliable for exactly these typo classes, see notes above).
+                results.append((word, [known_fix], True))
                 continue
             camel_split = _try_camelcase_split(word, lib, h)
             if camel_split:
-                results.append((word, [camel_split]))
+                results.append((word, [camel_split], True))
                 continue
             lower_split = _try_lowercase_compound_split(word, lib, h)
             if lower_split:
-                results.append((word, [lower_split]))
+                results.append((word, [lower_split], True))
                 continue
             slst = ctypes.POINTER(ctypes.c_char_p)()
             n = lib.Hunspell_suggest(h, ctypes.byref(slst), word.encode("utf-8"))
-            suggestions = [slst[i].decode("utf-8") for i in range(n)]
+            suggestions = _rerank(word, [slst[i].decode("utf-8") for i in range(n)])[:3]
             lib.Hunspell_free_list(h, ctypes.byref(slst), n)
-            results.append((word, _rerank(word, suggestions)[:3]))
+            confident = bool(suggestions) and _is_confident(word, suggestions[0])
+            results.append((word, suggestions, confident))
     return results
 
 
@@ -265,10 +370,27 @@ def _match_case(original, suggestion):
 
 
 def _is_confident(word, suggestion):
-    """Same guard as the JS side: don't auto-apply a suggestion that's
-    wildly different in length from the original (e.g. 'dont' -> 'font' -
-    both real words, same length, but no actual relationship in meaning).
-    Blunt, but prevents context-destroying silent substitutions."""
+    """Guard for a RAW dictionary suggestion only (i.e. hunspell's own
+    ranked guess, not a curated lookup or a verified two-word split - those
+    carry their own `confident=True` from check_spelling and skip this
+    entirely). Don't auto-apply a raw suggestion that's wildly different in
+    length from the original (e.g. 'dont' -> 'font' - both real words, same
+    length, but no actual relationship in meaning), or that inserts a
+    space/hyphen (raw multi-word suggestions are rarely right - Lesson 1).
+    Blunt, but prevents context-destroying silent substitutions.
+
+    BUG FIX (found 2026-08-25): this used to also be re-applied, via its
+    space/hyphen check, to suggestions that ALREADY came from
+    `_try_camelcase_split` / `_try_lowercase_compound_split` - which are
+    two-word results BY DESIGN (e.g. "PalletInfo" -> "Pallet Info"). Since
+    every multi-word suggestion always contains a space, this silently
+    blocked those verified splits from ever reaching "Suggested Change" -
+    they showed up correctly in the "Words To Correct" column but the
+    string itself was never actually fixed. Verified directly: before this
+    fix, `fix_spelling("PalletInfo needs review", ...)` returned the
+    string UNCHANGED despite detecting the correct split. Confidence is now
+    decided once, at the source, in check_spelling - this function is only
+    consulted for the raw-hunspell-suggestion case."""
     if " " in suggestion or "-" in suggestion:
         return False
     return abs(len(word) - len(suggestion)) <= 2
@@ -277,14 +399,15 @@ def _is_confident(word, suggestion):
 def fix_spelling(value, lang, custom_words=None):
     """Returns value with each misspelled word replaced by its top suggestion
     (word-boundary match, first/best suggestion only, case-matched to the
-    original, and ONLY when the suggestion passes a basic confidence check).
+    original, and ONLY when check_spelling marked it confident - see that
+    function's docstring for what "confident" means per source).
     Returns original value unchanged if the dictionary isn't available or
     nothing needs fixing."""
     misspellings = check_spelling(value, lang, custom_words)
     if not misspellings:
         return value
     fixed = value
-    for word, suggestions in misspellings:
-        if suggestions and _is_confident(word, suggestions[0]):
+    for word, suggestions, confident in misspellings:
+        if suggestions and confident:
             fixed = re.sub(rf"\b{re.escape(word)}\b", _match_case(word, suggestions[0]), fixed)
     return fixed
