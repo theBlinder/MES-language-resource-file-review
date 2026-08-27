@@ -1,0 +1,14 @@
+__pycache__/
+*.pyc
+.venv/
+venv/
+uploads/*
+!uploads/.gitkeep
+output/*
+!output/.gitkeep
+.DS_Store
+
+# Internal context/handoff docs - kept local only. See CLAUDE.md's own
+# Section 3 for why (not repeated here on purpose - this file is public).
+CLAUDE.md
+HANDOFF.md
