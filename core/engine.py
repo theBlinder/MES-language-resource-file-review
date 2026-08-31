@@ -275,7 +275,13 @@ def detect_extra_issues(entries, fixed_values):
         else:
             seen_keys[key] = lineno
 
-        words = fixed.split()
+        # Detect against the ORIGINAL value, not `fixed` - this function's own
+        # docstring says these are issues that should NOT be auto-fixed, only
+        # flagged, so detection must follow the same rule as check_entry():
+        # never let an earlier fix (spelling correction, casing, glossary
+        # substitution, etc.) hide or fabricate a repeated-word match that
+        # wasn't actually there in the source file being reviewed.
+        words = e["value"].split()
         for i in range(len(words) - 1):
             if "[" in words[i] or "[" in words[i + 1]:
                 continue

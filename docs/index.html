@@ -541,7 +541,137 @@ function spellCheckValue(value, dict, customWords) {
   return { issues, corrected };
 }
 
+// ---- Pure detection - mirrors Python's check_entry() in core/language_rules.py
+// exactly, check for check. Every rule here reads the untouched original
+// `value` directly - never a value mutated by an earlier rule in this same
+// function (there IS no earlier rule here; each branch below re-tests `value`
+// on its own), and never the progressively-fixed text that structuralFix/
+// spellCheckValue build up. This is what decides issue COUNTS and sheet
+// ROUTING. structuralFix/spellCheckValue below are used ONLY to build the
+// "Suggested Change" text - never for counting or routing.
+//
+// This replaces the old approach of counting issues from structuralFix's
+// own `notes` (which fired mid-mutation, over a progressively-fixed `v`) -
+// that let an earlier fix in the chain erase the evidence a later,
+// independent check needed. Concretely: a string like "No.Of items" has a
+// real Spacing issue (period glued to the next letter) as well as a real
+// Grammar issue ("No.Of" casing) - Python's check_entry (which never
+// mutates) counts both, but the old structuralFix-based counting fixed the
+// Grammar issue FIRST (adding the missing space as a side effect), so by
+// the time the general "missing space after punctuation" Spacing check ran
+// over the same mutating `v`, the gap was already gone and the Spacing
+// issue was silently lost. Keep this function in sync with check_entry() in
+// core/language_rules.py - same checks, same order, same gates.
+function checkEntry(value, lang, mixedCaseWords) {
+  mixedCaseWords = mixedCaseWords || new Set();
+  const issues = { Spacing: [], Grammar: [], Terminology: [] };
+  const v = value;
+
+  // ---------------- Spacing (language-aware) ----------------
+  if (v !== v.trim()) issues.Spacing.push("Leading/trailing whitespace");
+  if (v.includes("  ")) issues.Spacing.push("Double space");
+  if (/(?<!\s)([.,!?;:])(?=[A-Za-z])(?!\w*\.(gif|png|jpe?g|pdf|csv|xlsx?))/.test(v)) {
+    issues.Spacing.push("Missing space after punctuation (run-on sentence)");
+  }
+  if (!SPACE_BEFORE_PUNCT_LANGS.has(lang)) {
+    if (/\s+[,!?;:]/.test(v)) issues.Spacing.push("Unexpected space before punctuation");
+  } else {
+    // French-family: a MISSING space before ! ? ; : is the actual issue.
+    if (/[A-Za-z][!?;:]/.test(v)) issues.Spacing.push("Missing required space before punctuation (French-style spacing)");
+  }
+
+  // ---------------- Grammar (structural) ----------------
+  if (/([!?])\1+/.test(v)) issues.Grammar.push('Repeated punctuation (e.g. "!!")');
+  if (/\.\.(?!\.)/.test(v)) issues.Grammar.push("Double period (not an ellipsis)");
+  if (lang === "en" || lang === "unknown") {
+    if (/No\.Of\b/.test(v)) {
+      issues.Grammar.push('"No.Of" should be "No. of" (missing space, and "of" should be lowercase)');
+    } else if (/No\.\s*Of\b/.test(v)) {
+      issues.Grammar.push('"Of" should be lowercase: "No. of", not "No. Of"');
+    }
+  }
+
+  // Don't flag a custom-dictionary term with deliberate internal casing
+  // (e.g. "iPAS", "macOS") as "doesn't start with a capital" just because it
+  // happens to start with a lowercase letter - that casing is correct and
+  // intentional. Keep in sync with the same skip in check_entry() (Python).
+  const firstWordMatch = v.match(/^[A-Za-z][A-Za-z0-9']*/);
+  const firstWord = firstWordMatch ? firstWordMatch[0] : "";
+  const firstWordProtected = mixedCaseWords.has(firstWord);
+  const looksLikeSentence = v.split(/\s+/).filter(Boolean).length >= 3 || /[.!?:]\s*$/.test(v);
+  if (v && looksLikeSentence && /^[a-z]/.test(v) && (lang === "en" || lang === "unknown") && !firstWordProtected) {
+    issues.Grammar.push("Sentence does not start with a capital letter");
+  }
+
+  // A word capitalized right after a mid-sentence comma is almost always
+  // wrong in this kind of UI text. Scoped to a curated list of common
+  // instructional words to avoid flagging genuine proper nouns after a comma.
+  if (lang === "en" || lang === "unknown") {
+    const CONTINUATION_WORDS = new Set([
+      "please", "process", "add", "check", "click", "select", "enter",
+      "confirm", "contact", "ensure", "note", "review", "verify",
+      "wait", "try", "refresh", "update", "save", "choose", "the",
+      "this", "as", "and", "but",
+    ]);
+    for (const m of v.matchAll(/,\s+([A-Z][a-z]+)\b/g)) {
+      if (CONTINUATION_WORDS.has(m[1].toLowerCase())) {
+        issues.Grammar.push(`"${m[1]}" should be lowercase after a mid-sentence comma: "..., ${m[1].toLowerCase()}..."`);
+      }
+    }
+  }
+
+  // A string that mixes Title Case and sentence case internally (some
+  // content words capitalized, some not, with no consistent pattern).
+  // Conservative: only fires when BOTH patterns appear among content words
+  // (excludes minor words), and skipped entirely for multi-sentence strings
+  // (a capital after ". " there is correct, not inconsistent).
+  if (lang === "en" || lang === "unknown") {
+    const MINOR_WORDS = new Set(["of", "the", "a", "an", "in", "to", "and", "or", "is", "are", "was", "were", "by", "on", "at", "as", "per", "vs", "nor", "but", "for"]);
+    const hasMultipleSentences = /[.!?]\s+[A-Z]/.test(v);
+    const vForCase = v.replace(/\bNo\.\s*/g, "");
+    const contentWords = (vForCase.match(/[A-Za-z']+/g) || []).filter(w => !MINOR_WORDS.has(w.toLowerCase()) && w.length > 1);
+    if (contentWords.length >= 3 && !hasMultipleSentences) {
+      const rest = contentWords.slice(1);
+      const hasCap = rest.some(w => /^[A-Z]/.test(w) && w !== w.toUpperCase());
+      const hasLower = rest.some(w => /^[a-z]/.test(w));
+      if (hasCap && hasLower) {
+        issues.Grammar.push("Inconsistent capitalization - mixes Title Case and sentence case within the same string");
+      }
+    }
+  }
+
+  const words = v.split(/\s+/).filter(Boolean);
+  for (let i = 0; i < words.length - 1; i++) {
+    if (words[i].includes("[") || words[i + 1].includes("[")) continue;
+    const w1 = words[i].replace(/[^A-Za-z]/g, "").toLowerCase();
+    const w2 = words[i + 1].replace(/[^A-Za-z]/g, "").toLowerCase();
+    if (w1.length > 2 && w1 === w2) issues.Grammar.push(`Repeated word: "${words[i]} ${words[i + 1]}"`);
+  }
+
+  // ---------------- Terminology (glossary) ----------------
+  if (lang === "en" || lang === "unknown") {
+    for (const [wrong, canon] of Object.entries(GLOSSARY)) {
+      const re = new RegExp(`\\b${wrong}\\b`, "gi");
+      if (re.test(v) && !v.includes(canon)) {
+        issues.Terminology.push(`"${wrong}" should be "${canon}"`);
+      }
+    }
+    // Phrase-level consistency: same file uses "No. of X" AND "number of X"
+    // for the same concept in different strings - "number of" is the
+    // majority form actually used across this team's real files.
+    if (/\bNo\.\s*of\b/i.test(v)) {
+      issues.Terminology.push('"No. of" should be "number of" for consistency (the majority phrasing in this file)');
+    }
+  }
+
+  return issues;
+}
+
 // ---- Structural checks (spacing/grammar/terminology) - language-aware, always run ----
+// NOTE: this builds the "Suggested Change" text only (a progressive fix
+// chain, where each step intentionally sees the previous step's output -
+// that's correct for FIXING). It is NOT used for issue detection/counting -
+// see checkEntry() above for that.
 function structuralFix(value, lang, mixedCaseWords, customWordsForCasing) {
   mixedCaseWords = mixedCaseWords || new Set();
   customWordsForCasing = customWordsForCasing || new Set();
@@ -737,11 +867,20 @@ async function buildWorkbook(filename, entries, lang) {
   const spellingSupported = !NO_SPELLCHECK_SUPPORT.has(lang.code) && SPELLCHECK_DICTS[lang.code];
   let dict = null;
   let dictError = false;
-  let customWords = new Set();
+  // Custom words / mixed-case protection (e.g. "iPAS" must never be flagged
+  // by the "doesn't start with a capital" Grammar check) are needed for
+  // structural detection regardless of whether THIS language has a spelling
+  // dictionary - loading them must not be gated behind spellingSupported.
+  // Previously this was only loaded inside the `if (spellingSupported)`
+  // branch below, so files with no recognized language code in the filename
+  // (lang.code === "unknown", which still runs the en/unknown-gated Grammar
+  // checks) silently lost that protection. Keep in sync with Python, where
+  // get_custom_words()/get_mixed_case_custom_words() are always available
+  // independent of hunspell dictionary availability.
+  const customWords = await loadCustomWords();
   if (spellingSupported) {
     dict = await loadDictionary(lang.code);
     if (!dict) dictError = true;
-    customWords = await loadCustomWords();
   }
 
   const spelling = [HEADERS_SPELLING];
@@ -753,7 +892,9 @@ async function buildWorkbook(filename, entries, lang) {
   const seenKeys = {};
 
   entries.forEach(e => {
-    const { corrected: structFixed, notes } = structuralFix(e.value, lang.code, getMixedCaseCustomWords(), customWords);
+    // FIX chain - each step intentionally sees the previous step's output,
+    // building the best combined "Suggested Change" text.
+    const { corrected: structFixed } = structuralFix(e.value, lang.code, getMixedCaseCustomWords(), customWords);
 
     let spellIssues = [];
     let fullyCorrected = structFixed;
@@ -774,9 +915,13 @@ async function buildWorkbook(filename, entries, lang) {
       fullyCorrected = spellCheckValue(structFixed, dict, customWords).corrected;
     }
 
-    const spacingNotes = notes.filter(n => n.startsWith("Spacing"));
-    const grammarNotes = notes.filter(n => n.startsWith("Grammar"));
-    const termNotes = notes.filter(n => n.startsWith("Terminology"));
+    // DETECTION/ROUTING - independent per category, always against the
+    // untouched original value (see checkEntry's own comment for why this
+    // must be separate from the structuralFix chain above).
+    const detected = checkEntry(e.value, lang.code, getMixedCaseCustomWords());
+    const spacingNotes = detected.Spacing;
+    const grammarNotes = detected.Grammar;
+    const termNotes = detected.Terminology;
 
     // Each string lands in exactly ONE sheet - the single best-fitting
     // category - rather than being duplicated into every sheet whose check
@@ -821,7 +966,7 @@ async function buildWorkbook(filename, entries, lang) {
       seenKeys[e.key] = e.line;
     }
 
-    const hasAnyIssue = spellIssues.length > 0 || notes.length > 0;
+    const hasAnyIssue = spellIssues.length > 0 || spacingNotes.length > 0 || grammarNotes.length > 0 || termNotes.length > 0;
     if (!hasAnyIssue && !isDup) clean.push([e.line, e.key, e.value]);
   });
 
