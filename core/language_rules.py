@@ -54,6 +54,13 @@ def check_entry(value, lang="en", glossary=None):
     issues = {"Spacing": [], "Grammar": [], "Spelling": [], "Terminology": []}
     v = value
 
+    # Resolved once and reused by both the Terminology and Grammar sections
+    # below - Terminology needs it to find glossary mismatches, Grammar
+    # needs it to know which capitalized words are protected abbreviations
+    # (e.g. "IDH", "DRL") rather than genuine casing inconsistencies.
+    from core.engine import DEFAULT_GLOSSARY
+    active_glossary = glossary if glossary is not None else DEFAULT_GLOSSARY
+
     # ---------------- Spacing (language-aware) ----------------
     if v != v.strip():
         issues["Spacing"].append("Leading/trailing whitespace")
@@ -85,13 +92,30 @@ def check_entry(value, lang="en", glossary=None):
     # and intentional. Must match the same skip in engine.py's fix_value,
     # or detection and fixing disagree on whether this string has an issue.
     from core.spellcheck import get_mixed_case_custom_words
-    first_word_match = re.match(r"[A-Za-z][A-Za-z0-9']*", v)
-    first_word = first_word_match.group(0) if first_word_match else ""
-    first_word_protected = first_word in get_mixed_case_custom_words()
 
+    # A lowercase letter starting a NEW sentence - either the very start of
+    # the string, or right after a real sentence boundary (". "/"! "/"? ") -
+    # is a capitalization issue. Only position 0 needs the
+    # "looks_like_sentence" gate (a short 1-2 word label starting lowercase
+    # may be intentional, e.g. a UI hint); a position right after an
+    # already-confirmed ". "/"! "/"? " boundary is unambiguous on its own,
+    # so every such position is checked regardless of overall string length.
+    # BUG FIX: this used to only ever look at v[0] - a lowercase letter
+    # starting the SECOND (or later) sentence of a multi-sentence string
+    # (e.g. "Confirm the order. please proceed") was never even detected.
     looks_like_sentence = len(v.split()) >= 3 or v.rstrip().endswith((".", "!", "?", ":"))
-    if v and looks_like_sentence and v[0].islower() and v[0].isalpha() and lang in ("en", "unknown") and not first_word_protected:
-        issues["Grammar"].append("Sentence does not start with a capital letter")
+    if lang in ("en", "unknown"):
+        for m in re.finditer(r"(?:^|[.!?]\s+)([A-Za-z])", v):
+            start = m.start(1)
+            if not m.group(1).islower():
+                continue
+            if start == 0 and not looks_like_sentence:
+                continue
+            word_match = re.match(r"[A-Za-z][A-Za-z0-9']*", v[start:])
+            word = word_match.group(0) if word_match else ""
+            if word in get_mixed_case_custom_words():
+                continue
+            issues["Grammar"].append("Sentence does not start with a capital letter")
 
     # A word capitalized right after a mid-sentence comma is almost always
     # wrong in this kind of UI text - real examples found in this file:
@@ -132,8 +156,22 @@ def check_entry(value, lang="en", glossary=None):
         if len(content_words) >= 3 and not has_multiple_sentences:
             # skip the first word (sentence/title start is always capitalized either way)
             rest = content_words[1:]
-            has_cap = any(w[:1].isupper() and not w.isupper() for w in rest)
-            has_lower = any(w[:1].islower() for w in rest)
+            # An ALL-CAPS acronym (e.g. "LAB") or a protected custom-
+            # dictionary/glossary term (e.g. "Vegam", "DRL") is not evidence
+            # of a real casing inconsistency either way - excluded from the
+            # vote entirely, same set `_fix_mixed_case_casing` in engine.py
+            # treats as exempt, so detection and fixing never disagree on
+            # what counts as "inconsistent" here.
+            from core.spellcheck import get_custom_words
+            custom_words = get_custom_words()
+            protected_terms = {k.lower() for k in active_glossary} | {str(x).lower() for x in active_glossary.values()}
+
+            def _is_exempt(w):
+                return w.isupper() or w.lower() in custom_words or w.lower() in protected_terms
+
+            votable = [w for w in rest if not _is_exempt(w)]
+            has_cap = any(w[:1].isupper() and not w.isupper() for w in votable)
+            has_lower = any(w[:1].islower() for w in votable)
             if has_cap and has_lower:
                 issues["Grammar"].append(
                     "Inconsistent capitalization - mixes Title Case and sentence case within the same string"
@@ -149,19 +187,13 @@ def check_entry(value, lang="en", glossary=None):
             issues["Grammar"].append(f'Repeated word: "{words[i]} {words[i+1]}"')
 
     # ---------------- Terminology (glossary, language-specific lists) ----
-    # BUG FIX (found 2026-08-25): this used to always import and use the
-    # hardcoded 8-entry DEFAULT_GLOSSARY from core/engine.py, ignoring
-    # whatever glossary was actually passed in - so a custom glossary.json
-    # entry (e.g. "idh" -> "IDH") could correctly appear in the fixed
-    # "Suggested Change" text (which does use the real merged glossary) while
-    # never being counted as a Terminology issue for ROUTING purposes,
-    # because this detection step was checking a different, stale glossary.
-    # Verified directly: before this fix, "idh label missing..." showed 0
-    # Terminology issues here even with "idh" in glossary.json. Now uses
-    # whatever glossary the caller passes in, falling back to
-    # DEFAULT_GLOSSARY only if none is given.
-    from core.engine import DEFAULT_GLOSSARY
-    active_glossary = glossary if glossary is not None else DEFAULT_GLOSSARY
+    # `active_glossary` was resolved once at the top of this function (BUG
+    # FIX, found 2026-08-25: this used to re-import and use the hardcoded
+    # 8-entry DEFAULT_GLOSSARY here regardless of what was actually passed
+    # in, so a custom glossary.json entry could appear in the fixed
+    # "Suggested Change" text but never get counted as a Terminology issue
+    # for ROUTING purposes - verified directly, "idh label missing..."
+    # showed 0 Terminology issues even with "idh" in glossary.json).
     if lang in ("en", "unknown"):
         for wrong, canon in active_glossary.items():
             if re.search(rf"\b{re.escape(wrong)}\b", v, flags=re.IGNORECASE) and canon not in v:
@@ -177,8 +209,15 @@ def check_entry(value, lang="en", glossary=None):
             )
 
     # ---------------- Spelling (real dictionary check via Hunspell) --------
+    # Glossary keys (e.g. "ccp", "idh") are known abbreviations, not
+    # misspellings - Terminology above already owns correcting their casing.
+    # Without this, a word like "ccp" got flagged as BOTH a Terminology
+    # issue ("ccp" should be "CCP") AND a Spelling issue with an unrelated,
+    # nonsensical dictionary guess (e.g. "cp"), since spellcheck had no idea
+    # it was a recognized domain term.
     from core.spellcheck import check_spelling, get_custom_words
-    spelling_hits = check_spelling(v, lang, get_custom_words())
+    spelling_skip_words = get_custom_words() | {k.lower() for k in active_glossary}
+    spelling_hits = check_spelling(v, lang, spelling_skip_words)
     if spelling_hits is None:
         pass  # dictionary not available for this language - not checked, not "clean"
     else:

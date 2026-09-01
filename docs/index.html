@@ -143,6 +143,12 @@
   .results-actions { display: flex; align-items: center; gap: 16px; flex-wrap: wrap; }
   .results-actions button { width: auto; flex: 1 1 auto; margin-top: 0; }
 
+  .download-warning {
+    margin-top: 14px; padding: 10px 14px;
+    border: 1.5px solid var(--flag); background: var(--flag-bg);
+    border-radius: 10px; font-size: 13px; color: var(--ink);
+  }
+
   a.btn-ghost {
     color: var(--muted); text-decoration: none;
     font-size: 13px; font-weight: 600; cursor: pointer;
@@ -184,19 +190,16 @@
       <label class="row">
         Language:
         <select id="langSelect">
-          <option value="auto">Auto-detect from filename</option>
-          <option value="en">English (en)</option>
-          <option value="de">German (de)</option>
-          <option value="zh">Chinese (zh) - spelling not supported</option>
-          <option value="ja">Japanese (ja) - spelling not supported</option>
-          <option value="fr">French (fr)</option>
-          <option value="es">Spanish (es)</option>
-          <option value="it">Italian (it)</option>
-          <option value="pt">Portuguese (pt)</option>
-          <option value="unknown">Unknown / other</option>
+          <option value="auto">Select</option>
+          <option value="en">English (EN)</option>
+          <option value="de">German (DE)</option>
+          <option value="zh">Chinese (ZH)</option>
+          <option value="ja">Japanese (JA)</option>
+          <option value="unknown">Others</option>
         </select>
       </label>
       <div class="langnote" id="langNote"></div>
+      <div class="download-warning" id="undownloadedNote" style="display:none;"></div>
 
       <button id="runBtn" disabled>Run QA check</button>
       <div class="status" id="statusMsg"></div>
@@ -221,7 +224,7 @@ const KNOWN_LANG_CODES = {
   ru: "Russian", ja: "Japanese", zh: "Chinese", ko: "Korean", ar: "Arabic", hi: "Hindi"
 };
 const SPACE_BEFORE_PUNCT_LANGS = new Set(["fr"]);
-const GLOSSARY = { ip: "IP", sop: "SOP", hu: "HU", po: "PO", fg: "FG", qc: "QC", sscc: "SSCC", drl: "DRL", idh: "IDH" };
+const GLOSSARY = { ip: "IP", sop: "SOP", hu: "HU", po: "PO", fg: "FG", qc: "QC", sscc: "SSCC", drl: "DRL", idh: "IDH", ccp: "CCP" };
 // Hunspell dictionaries only meaningfully exist / apply for space-delimited languages.
 // CJK (zh, ja, ko) need word-segmentation-based tooling, not Hunspell - not attempted here.
 // Dictionaries are bundled in docs/dictionaries/ (same-origin) rather than fetched from
@@ -449,24 +452,80 @@ const REAL_WORD_TYPO_FIXES = {
   sech: "search",
 };
 
+// Requires each half to be at least 4 letters - a short fragment either
+// side (e.g. "en" + "Ter" from "enTer") is far more likely a single word
+// with one stray capital letter than two real words glued together; see
+// tryStrayCapitalFix, which is tried first and handles that case.
 function trySplitCamelCase(word, dict) {
   const m = word.match(/[a-z][A-Z]/);
   if (!m) return null;
   const splitAt = m.index + 1;
   const left = word.slice(0, splitAt);
   const right = word.slice(splitAt);
+  if (left.length < 4 || right.length < 4) return null;
   if (dict.check(left) && dict.check(right)) return `${left} ${right}`;
   return null;
 }
 
+// A word with an unexpected capital letter somewhere after the first
+// character (e.g. "enTer") is almost always a single word typed with a
+// stray capital, not two words glued together. If lowercasing the whole
+// word yields a real dictionary word, that is a far safer, more targeted
+// fix than guessing a two-word split - checked before any split is
+// attempted. Verified directly: without this, "enTer" matched the
+// camelCase-split boundary ("en" + "Ter", both individually valid
+// dictionary entries) and produced the nonsensical "en Ter" instead of the
+// obviously-intended "enter".
+function tryStrayCapitalFix(word, dict) {
+  if (word.length < 2 || !/[A-Z]/.test(word.slice(1))) return null;
+  const lowered = word.toLowerCase();
+  if (dict.check(lowered)) return lowered;
+  return null;
+}
+
+// Only returns a split when exactly ONE split point is valid. A word like
+// "groupset" has two: "gro"+"upset" AND "group"+"set" - with no way to know
+// which one is intended, blindly picking the first one found (as this used
+// to) produced the nonsensical "gro upset". When the split is ambiguous
+// like this, the word is most likely a real compound term simply missing
+// from the dictionary (see custom_dictionary.txt) rather than two words
+// missing a space, so no split is offered at all.
 function tryLowercaseCompoundSplit(word, dict) {
   if (word.length < 6 || word !== word.toLowerCase()) return null;
+  const candidates = [];
   for (let i = 3; i <= word.length - 3; i++) {
     const left = word.slice(0, i);
     const right = word.slice(i);
-    if (dict.check(left) && dict.check(right)) return `${left} ${right}`;
+    if (dict.check(left) && dict.check(right)) candidates.push(`${left} ${right}`);
   }
-  return null;
+  return candidates.length === 1 ? candidates[0] : null;
+}
+
+// Common English derivational prefixes. A word not recognized as a single
+// dictionary entry may still be a completely standard compound: one of
+// these prefixes attached directly to a real base word (e.g. "underdosed" =
+// under + dosed, "premixture" = pre + mixture, "inprogress" = in +
+// progress). This is a GENERAL rule, not a per-word list - it is what stops
+// the checker from "correcting" this whole class of word into something
+// meaning-changing (e.g. "inprogress" -> "progress", which silently drops
+// the very prefix that carries the word's meaning) instead of leaving it
+// alone. Sorted longest-first when matched so e.g. "undermine" checks
+// against "under" before the shorter "un" could apply. Keep in sync with
+// _DERIVATIONAL_PREFIXES in core/spellcheck.py.
+const DERIVATIONAL_PREFIXES = [
+  "counter", "inter", "under", "over", "semi", "multi", "auto", "anti",
+  "post", "non", "pre", "sub", "mis", "dis", "re", "un", "in", "co", "de",
+].sort((a, b) => b.length - a.length);
+
+function isValidPrefixedCompound(word, dict) {
+  const wl = word.toLowerCase();
+  for (const p of DERIVATIONAL_PREFIXES) {
+    if (wl.startsWith(p) && wl.length - p.length >= 3) {
+      const rest = wl.slice(p.length);
+      if (dict.check(rest)) return true;
+    }
+  }
+  return false;
 }
 
 // Replace [placeholder] spans with same-length '#' filler so nothing inside
@@ -501,6 +560,11 @@ function spellCheckValue(value, dict, customWords) {
       continue;
     }
     if (!dict.check(w)) {
+      if (isValidPrefixedCompound(w, dict)) {
+        // Standard prefix + real base word (see isValidPrefixedCompound) -
+        // correctly spelled as one word, not a misspelling at all.
+        continue;
+      }
       const knownFix = CONTRACTION_FIXES[w.toLowerCase()] || KNOWN_TYPO_FIXES[w.toLowerCase()];
       if (knownFix) {
         // Known contraction or hand-verified typo - use directly, skip
@@ -508,6 +572,13 @@ function spellCheckValue(value, dict, customWords) {
         issues.push({ word: w, best: knownFix, confident: true, alternatives: [] });
         const re = new RegExp(`\\b${w.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\b`);
         corrected = corrected.replace(re, matchCase(w, knownFix));
+        continue;
+      }
+      const strayCapFix = tryStrayCapitalFix(w, dict);
+      if (strayCapFix) {
+        issues.push({ word: w, best: strayCapFix, confident: true, alternatives: [] });
+        const re = new RegExp(`\\b${w.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\b`);
+        corrected = corrected.replace(re, strayCapFix);
         continue;
       }
       const camelSplit = trySplitCamelCase(w, dict);
@@ -562,8 +633,9 @@ function spellCheckValue(value, dict, customWords) {
 // over the same mutating `v`, the gap was already gone and the Spacing
 // issue was silently lost. Keep this function in sync with check_entry() in
 // core/language_rules.py - same checks, same order, same gates.
-function checkEntry(value, lang, mixedCaseWords) {
+function checkEntry(value, lang, mixedCaseWords, customWordsForCasing) {
   mixedCaseWords = mixedCaseWords || new Set();
+  customWordsForCasing = customWordsForCasing || new Set();
   const issues = { Spacing: [], Grammar: [], Terminology: [] };
   const v = value;
 
@@ -591,16 +663,28 @@ function checkEntry(value, lang, mixedCaseWords) {
     }
   }
 
-  // Don't flag a custom-dictionary term with deliberate internal casing
-  // (e.g. "iPAS", "macOS") as "doesn't start with a capital" just because it
-  // happens to start with a lowercase letter - that casing is correct and
-  // intentional. Keep in sync with the same skip in check_entry() (Python).
-  const firstWordMatch = v.match(/^[A-Za-z][A-Za-z0-9']*/);
-  const firstWord = firstWordMatch ? firstWordMatch[0] : "";
-  const firstWordProtected = mixedCaseWords.has(firstWord);
+  // A lowercase letter starting a NEW sentence - either the very start of
+  // the string, or right after a real sentence boundary (". "/"! "/"? ") -
+  // is a capitalization issue. Only position 0 needs the "looksLikeSentence"
+  // gate (a short 1-2 word label starting lowercase may be intentional); a
+  // position right after an already-confirmed ". "/"! "/"? " boundary is
+  // unambiguous on its own, so every such position is checked regardless of
+  // overall string length. BUG FIX: this used to only ever look at v[0] - a
+  // lowercase letter starting the SECOND (or later) sentence of a
+  // multi-sentence string was never even detected. Don't flag a
+  // custom-dictionary term with deliberate internal casing (e.g. "iPAS",
+  // "macOS") starting right there - that casing is correct and intentional.
+  // Keep in sync with the same logic in check_entry() (Python).
   const looksLikeSentence = v.split(/\s+/).filter(Boolean).length >= 3 || /[.!?:]\s*$/.test(v);
-  if (v && looksLikeSentence && /^[a-z]/.test(v) && (lang === "en" || lang === "unknown") && !firstWordProtected) {
-    issues.Grammar.push("Sentence does not start with a capital letter");
+  if (lang === "en" || lang === "unknown") {
+    for (const m of v.matchAll(/(?:^|[.!?]\s+)([a-z])/g)) {
+      const start = m.index + m[0].length - 1;
+      if (start === 0 && !looksLikeSentence) continue;
+      const wordMatch = v.slice(start).match(/^[A-Za-z][A-Za-z0-9']*/);
+      const word = wordMatch ? wordMatch[0] : "";
+      if (mixedCaseWords.has(word)) continue;
+      issues.Grammar.push("Sentence does not start with a capital letter");
+    }
   }
 
   // A word capitalized right after a mid-sentence comma is almost always
@@ -622,9 +706,14 @@ function checkEntry(value, lang, mixedCaseWords) {
 
   // A string that mixes Title Case and sentence case internally (some
   // content words capitalized, some not, with no consistent pattern).
-  // Conservative: only fires when BOTH patterns appear among content words
-  // (excludes minor words), and skipped entirely for multi-sentence strings
-  // (a capital after ". " there is correct, not inconsistent).
+  // Conservative: only fires when BOTH patterns appear among VOTABLE
+  // content words (excludes minor words, and excludes ALL-CAPS acronyms
+  // like "LAB" plus protected custom-dictionary/glossary terms - those are
+  // not evidence of inconsistency either way, same exemption
+  // `_fix_mixed_case_casing`'s counterpart in engine.py uses so detection
+  // and fixing never disagree on what counts as "inconsistent" here), and
+  // skipped entirely for multi-sentence strings (a capital after ". " there
+  // is correct, not inconsistent).
   if (lang === "en" || lang === "unknown") {
     const MINOR_WORDS = new Set(["of", "the", "a", "an", "in", "to", "and", "or", "is", "are", "was", "were", "by", "on", "at", "as", "per", "vs", "nor", "but", "for"]);
     const hasMultipleSentences = /[.!?]\s+[A-Z]/.test(v);
@@ -632,8 +721,14 @@ function checkEntry(value, lang, mixedCaseWords) {
     const contentWords = (vForCase.match(/[A-Za-z']+/g) || []).filter(w => !MINOR_WORDS.has(w.toLowerCase()) && w.length > 1);
     if (contentWords.length >= 3 && !hasMultipleSentences) {
       const rest = contentWords.slice(1);
-      const hasCap = rest.some(w => /^[A-Z]/.test(w) && w !== w.toUpperCase());
-      const hasLower = rest.some(w => /^[a-z]/.test(w));
+      const protectedWords = new Set([
+        ...Object.keys(GLOSSARY),
+        ...Object.values(GLOSSARY).map(x => String(x).toLowerCase()),
+      ]);
+      const isExempt = (w) => w === w.toUpperCase() || customWordsForCasing.has(w.toLowerCase()) || protectedWords.has(w.toLowerCase()) || mixedCaseWords.has(w);
+      const votable = rest.filter(w => !isExempt(w));
+      const hasCap = votable.some(w => /^[A-Z]/.test(w) && w !== w.toUpperCase());
+      const hasLower = votable.some(w => /^[a-z]/.test(w));
       if (hasCap && hasLower) {
         issues.Grammar.push("Inconsistent capitalization - mixes Title Case and sentence case within the same string");
       }
@@ -743,30 +838,35 @@ function structuralFix(value, lang, mixedCaseWords, customWordsForCasing) {
   const deperiod = v.replace(/\.\.(?!\.)/g, ".");
   if (deperiod !== v) { cats.push("Grammar: fixed double period"); v = deperiod; }
 
-  // Don't blindly uppercase the first letter if the first word is a
+  // Capitalize the start of EVERY sentence, not just the first one in the
+  // string. BUG FIX: this used to only ever touch v[0] - a lowercase letter
+  // starting the second (or later) sentence of a multi-sentence string
+  // (e.g. "Confirm the order. please proceed") was silently never fixed.
+  // Don't blindly uppercase a letter if the word starting right there is a
   // custom-dictionary term with deliberate internal casing (e.g. "iPAS",
   // "macOS") - doing so corrupts it (e.g. "iPAS" -> "IPAS"). Found via
   // MRG's explicit "leave iPAS as is" instruction, 2026-08-25. Keep in
-  // sync with the same skip in core/engine.py's fix_value.
-  const firstWordMatch = v.match(/^[A-Za-z][A-Za-z0-9']*/);
-  const firstWordProtected = firstWordMatch && mixedCaseWords.has(firstWordMatch[0]);
-
+  // sync with the same logic in core/engine.py's fix_value.
   const looksLikeSentence = v.split(/\s+/).filter(Boolean).length >= 3 || /[.!?:]\s*$/.test(v);
-  if (v && looksLikeSentence && /^[a-z]/.test(v) && (lang === "en" || lang === "unknown") && !firstWordProtected) {
-    // Still apply the mechanical fix (so "Suggested Change" is correctly
-    // capitalized) regardless of why v currently starts lowercase - but only
-    // COUNT it as a Grammar issue for sheet-routing purposes if the ORIGINAL
-    // string itself started lowercase. Without this guard, an earlier fix in
-    // this same pipeline (e.g. "No. of" -> "number of") can turn a string
-    // that originally started with a capital letter into one that starts
-    // lowercase, and this check would then misfire and steal the row into
-    // Grammar even though there was never a real capitalization problem in
-    // the original text. The Python side avoids this entirely because its
-    // routing check (check_entry) only ever looks at the untouched original
-    // value, never a progressively-fixed one - this mirrors that.
-    v = v[0].toUpperCase() + v.slice(1);
-    if (/^[a-z]/.test(value)) {
-      cats.push("Grammar: capitalized sentence start");
+  if (lang === "en" || lang === "unknown") {
+    const capitalized = v.replace(/(^|[.!?]\s+)([a-z])/g, (whole, prefix, letter, offset) => {
+      const letterStart = offset + prefix.length;
+      if (letterStart === 0 && !looksLikeSentence) return whole;
+      const wordMatch = v.slice(letterStart).match(/^[A-Za-z][A-Za-z0-9']*/);
+      const word = wordMatch ? wordMatch[0] : "";
+      if (mixedCaseWords.has(word)) return whole;
+      return prefix + letter.toUpperCase();
+    });
+    if (capitalized !== v) {
+      v = capitalized;
+      // Only COUNT this as a Grammar issue for sheet-routing purposes if the
+      // ORIGINAL string actually had this problem somewhere - same
+      // discipline as every other fix in this pipeline that runs on the
+      // progressively-fixed `v` (see the comma-continuation-casing note
+      // above for the full rationale).
+      if (/(^|[.!?]\s+)[a-z]/.test(value)) {
+        cats.push("Grammar: capitalized sentence start");
+      }
     }
   }
 
@@ -789,13 +889,24 @@ function structuralFix(value, lang, mixedCaseWords, customWordsForCasing) {
   // evaluates against the untouched original value); this mirrors that.
   //
   // Once detected, the FIX (mirrors _fix_mixed_case_casing in
-  // core/engine.py) lowercases every wrongly-capitalized content word
-  // after the first one, treating sentence case as the target - skipping
-  // custom-dictionary and glossary-protected words (IDH, Vegam, HCode,
-  // iPAS, DRL, etc.) so they're never silently changed. Gated behind the
-  // SAME conservative detection above, so a short intentional Title-Case
-  // label like "Please Confirm" never reaches this code (too few content
-  // words, or no actual mix).
+  // core/engine.py) treats the MAJORITY casing among the words actually
+  // eligible to change as this string's real style, and converts only the
+  // minority OUTLIER words to match it - never touching a word that's
+  // already consistent with the majority, an ALL-CAPS acronym (e.g. "LAB"),
+  // or a protected custom-dictionary/glossary term (IDH, Vegam, HCode,
+  // iPAS, DRL, etc.). A tie defaults to sentence case (this rule's
+  // long-standing default direction).
+  //
+  // BUG FIX: this used to always assume sentence case was the "correct"
+  // target and blindly lowercase every capitalized content word after the
+  // first - so a string with one genuinely inconsistent word elsewhere
+  // could still wrongly lowercase an unrelated, correctly-capitalized word
+  // (e.g. "Resume" in "...Hold/Resume...") just for being Title Case
+  // somewhere in the same string, or strip a deliberate Title-Case heading
+  // like "LAB Materials Handling Guide" down toward sentence case word by
+  // word. Gated behind the SAME conservative detection above, so a short
+  // intentional Title-Case label like "Please Confirm" never reaches this
+  // code (too few content words, or no actual mix).
   if (lang === "en" || lang === "unknown") {
     const MINOR_WORDS = new Set(["of","the","a","an","in","to","and","or","is","are","was","were","by","on","at","as","per","vs","nor","but","for"]);
     const hasMultipleSentences = /[.!?]\s+[A-Z]/.test(value);
@@ -803,24 +914,25 @@ function structuralFix(value, lang, mixedCaseWords, customWordsForCasing) {
     const contentWords = (vForCase.match(/[A-Za-z']+/g) || []).filter(w => !MINOR_WORDS.has(w.toLowerCase()) && w.length > 1);
     if (contentWords.length >= 3 && !hasMultipleSentences) {
       const rest = contentWords.slice(1);
-      const hasCap = rest.some(w => /^[A-Z]/.test(w) && w !== w.toUpperCase());
-      const hasLower = rest.some(w => /^[a-z]/.test(w));
-      if (hasCap && hasLower) {
+      const protectedWords = new Set([
+        ...Object.keys(GLOSSARY),
+        ...Object.values(GLOSSARY).map(x => String(x).toLowerCase()),
+      ]);
+      const isExempt = (w) => w === w.toUpperCase() || customWordsForCasing.has(w.toLowerCase()) || protectedWords.has(w.toLowerCase()) || mixedCaseWords.has(w);
+      const votable = rest.filter(w => !isExempt(w));
+      const capCount = votable.filter(w => /^[A-Z]/.test(w) && w !== w.toUpperCase()).length;
+      const lowCount = votable.filter(w => /^[a-z]/.test(w)).length;
+      if (capCount > 0 && lowCount > 0) {
         cats.push("Grammar: inconsistent capitalization (mixes Title Case and sentence case)");
-        const protectedWords = new Set([
-          ...Object.keys(GLOSSARY),
-          ...Object.values(GLOSSARY).map(x => String(x).toLowerCase()),
-        ]);
+        const targetIsTitle = capCount > lowCount;
         let seenFirstContentWord = false;
         v = v.replace(/[A-Za-z']+/g, (word) => {
           if (MINOR_WORDS.has(word.toLowerCase()) || word.length <= 1) return word;
           if (!seenFirstContentWord) { seenFirstContentWord = true; return word; }
-          if (mixedCaseWords.has(word) || (customWordsForCasing && matchesCustomWord(word.toLowerCase(), customWordsForCasing)) || protectedWords.has(word.toLowerCase())) {
-            return word;
-          }
-          if (/^[A-Z]/.test(word) && word !== word.toUpperCase()) {
-            return word[0].toLowerCase() + word.slice(1);
-          }
+          if (isExempt(word)) return word;
+          const isTitle = /^[A-Z]/.test(word) && word !== word.toUpperCase();
+          if (targetIsTitle && !isTitle) return word[0].toUpperCase() + word.slice(1);
+          if (!targetIsTitle && isTitle) return word[0].toLowerCase() + word.slice(1);
           return word;
         });
       }
@@ -891,6 +1003,15 @@ async function buildWorkbook(filename, entries, lang) {
   const clean = [["Line", "Resource Key", "Current Value"]];
   const seenKeys = {};
 
+  // Glossary keys (e.g. "ccp", "idh") are known abbreviations, not
+  // misspellings - Terminology already owns correcting their casing.
+  // Without this, a word like "ccp" got flagged as BOTH a Terminology issue
+  // ("ccp" should be "CCP") AND a Spelling issue with an unrelated,
+  // nonsensical dictionary guess (e.g. "cp"), since spellcheck had no idea
+  // it was a recognized domain term. Keep in sync with the same union in
+  // check_entry()/fix_value() (Python).
+  const spellingSkipWords = new Set([...customWords, ...Object.keys(GLOSSARY)]);
+
   entries.forEach(e => {
     // FIX chain - each step intentionally sees the previous step's output,
     // building the best combined "Suggested Change" text.
@@ -909,16 +1030,16 @@ async function buildWorkbook(filename, entries, lang) {
       // lower-priority sheet is left. This mirrors the Python side, where
       // check_entry's spelling check always runs against the untouched
       // original value, independent of every other check.
-      spellIssues = spellCheckValue(e.value, dict, customWords).issues;
+      spellIssues = spellCheckValue(e.value, dict, spellingSkipWords).issues;
       // The corrected TEXT shown in "Suggested Change" still chains every
       // fix together (structural fixes, then spelling) same as before.
-      fullyCorrected = spellCheckValue(structFixed, dict, customWords).corrected;
+      fullyCorrected = spellCheckValue(structFixed, dict, spellingSkipWords).corrected;
     }
 
     // DETECTION/ROUTING - independent per category, always against the
     // untouched original value (see checkEntry's own comment for why this
     // must be separate from the structuralFix chain above).
-    const detected = checkEntry(e.value, lang.code, getMixedCaseCustomWords());
+    const detected = checkEntry(e.value, lang.code, getMixedCaseCustomWords(), customWords);
     const spacingNotes = detected.Spacing;
     const grammarNotes = detected.Grammar;
     const termNotes = detected.Terminology;
@@ -1003,6 +1124,13 @@ async function buildWorkbook(filename, entries, lang) {
 
 // ============ UI wiring ============
 let currentFile = null;
+// Tracks whether the CURRENT report (the one shown on screen right now) has
+// been downloaded yet - reset to false every time a new report is
+// generated, set to true only when the download button is actually clicked.
+// "Check another file" checks this and surfaces a non-blocking reminder if
+// not - see resetBtn handler below. This never stops the user from moving
+// on to the next file; it only makes sure they're told.
+let reportDownloaded = false;
 const dropzone = document.getElementById("dropzone");
 const fileInput = document.getElementById("fileInput");
 
@@ -1037,6 +1165,7 @@ document.getElementById("runBtn").addEventListener("click", async () => {
   runBtn.disabled = true;
   statusEl.className = "status";
   statusEl.textContent = "Checking...";
+  document.getElementById("undownloadedNote").style.display = "none";
 
   const reader = new FileReader();
   reader.onload = async (evt) => {
@@ -1070,7 +1199,11 @@ document.getElementById("runBtn").addEventListener("click", async () => {
       `<div class="stamp clean" style="animation-delay:${6*40}ms"><div class="n">${stats.clean}</div><div class="l">Clean</div></div>`;
 
     const outName = currentFile.name.replace(/\.js$/, "") + ".qa_report.xlsx";
-    document.getElementById("downloadBtn").onclick = () => XLSX.writeFile(wb, outName);
+    reportDownloaded = false;
+    document.getElementById("downloadBtn").onclick = () => {
+      XLSX.writeFile(wb, outName);
+      reportDownloaded = true;
+    };
     // Swap panels rather than stacking the report below the upload form -
     // this is a one-upload-one-download flow, so only one panel needs to
     // be on screen at a time (keeps the page fitting in the viewport
@@ -1084,7 +1217,19 @@ document.getElementById("runBtn").addEventListener("click", async () => {
 
 // "Check another file" - resets back to the upload panel without a full
 // page reload, so a second file doesn't require re-fetching the dictionary.
-document.getElementById("resetBtn").addEventListener("click", () => {
+// Only one report is ever kept "live" (the in-memory workbook + download
+// button get overwritten by the next run) - if the current one hasn't been
+// downloaded yet, this surfaces a reminder on the upload panel, but never
+// blocks moving on to the next file.
+function goToUploadPanel(undownloadedNote) {
+  const noteEl = document.getElementById("undownloadedNote");
+  if (undownloadedNote) {
+    noteEl.textContent = undownloadedNote;
+    noteEl.style.display = "block";
+  } else {
+    noteEl.style.display = "none";
+    noteEl.textContent = "";
+  }
   currentFile = null;
   fileInput.value = "";
   document.getElementById("dzFile").textContent = "";
@@ -1094,6 +1239,14 @@ document.getElementById("resetBtn").addEventListener("click", () => {
   document.getElementById("runBtn").disabled = true;
   document.getElementById("results").style.display = "none";
   document.getElementById("uploadPanel").style.display = "block";
+}
+
+document.getElementById("resetBtn").addEventListener("click", () => {
+  const prevName = document.getElementById("resultFilename").textContent;
+  const note = reportDownloaded
+    ? null
+    : `Your previous Excel report ("${prevName}") was not downloaded and will no longer be available once you check another file.`;
+  goToUploadPanel(note);
 });
 </script>
 </body>

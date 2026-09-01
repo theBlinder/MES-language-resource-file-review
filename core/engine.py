@@ -76,11 +76,21 @@ def _fix_mixed_case_casing(v, glossary):
     anything. Added 2026-08-27 per MRG's explicit request to also fix what
     gets flagged there. Uses the exact same gate as detection (content
     words >= 3, single sentence, a real capitalized/lowercase mix among the
-    words after the first one) so this never touches a string that
-    detection wouldn't also flag. Once gated in, treats sentence case as
-    the target: every content word after the first is lowercased UNLESS
-    it's protected (a custom-dictionary term or a glossary value/key -
-    IDH, Vegam, HCode, iPAS, DRL, etc. must never be silently lowercased)."""
+    words after the first one, ignoring exempt words) so this never touches
+    a string that detection wouldn't also flag.
+
+    BUG FIX: this used to always assume sentence case was the "correct"
+    target and blindly lowercase every capitalized content word after the
+    first - so a string like "Please Hold/Resume the Process" with one
+    genuinely inconsistent word elsewhere could still wrongly lowercase an
+    unrelated, correctly-capitalized word like "Resume" just for being
+    Title Case somewhere in the same string. Now the MAJORITY casing among
+    the words actually eligible to change (i.e. excluding acronyms and
+    protected terms - see `_is_exempt` below) is treated as this string's
+    real style, and only the minority OUTLIER words get converted to match
+    it; a word that's already consistent with the majority is never
+    touched, regardless of its own case. A tie defaults to sentence case
+    (this function's long-standing default direction)."""
     has_multiple_sentences = bool(re.search(r"[.!?]\s+[A-Z]", v))
     if has_multiple_sentences:
         return v
@@ -90,31 +100,44 @@ def _fix_mixed_case_casing(v, glossary):
     if len(content) < 3:
         return v
     rest = content[1:]
-    has_cap = any(w[:1].isupper() and not w.isupper() for w in rest)
-    has_lower = any(w[:1].islower() for w in rest)
-    if not (has_cap and has_lower):
-        return v
 
     from core.spellcheck import get_custom_words
     custom_words = get_custom_words()
     protected = {k.lower() for k in (glossary or {})} | {str(x).lower() for x in (glossary or {}).values()}
 
+    def _is_exempt(w):
+        # ALL-CAPS acronym (e.g. "LAB") or a protected custom-dictionary/
+        # glossary term (e.g. "Vegam", "DRL") - casing is deliberate and
+        # never counts as evidence either way, nor is it ever changed.
+        return w.isupper() or w.lower() in custom_words or w.lower() in protected
+
+    votable = [w for w in rest if not _is_exempt(w)]
+    cap_count = sum(1 for w in votable if w[:1].isupper() and not w.isupper())
+    low_count = sum(1 for w in votable if w[:1].islower())
+    if cap_count == 0 or low_count == 0:
+        return v  # no real mix among the words actually eligible to change
+
+    target_is_title = cap_count > low_count
+
     seen_first_content_word = [False]
 
-    def _decap(m):
+    def _recase(m):
         word = m.group(0)
         if word.lower() in _MINOR_WORDS_CASING or len(word) <= 1:
             return word
         if not seen_first_content_word[0]:
             seen_first_content_word[0] = True
             return word  # never touch the first content word
-        if word.lower() in custom_words or word.lower() in protected:
-            return word  # protected domain term - casing is deliberate
-        if word[:1].isupper() and not word.isupper():
+        if _is_exempt(word):
+            return word  # protected/acronym - casing is deliberate
+        is_title = word[:1].isupper() and not word.isupper()
+        if target_is_title and not is_title:
+            return word[:1].upper() + word[1:]
+        if not target_is_title and is_title:
             return word[:1].lower() + word[1:]
-        return word
+        return word  # already matches the winning style - leave it alone
 
-    return re.sub(r"[A-Za-z']+", _decap, v)
+    return re.sub(r"[A-Za-z']+", _recase, v)
 
 
 def fix_value(value, glossary, use_language_tool=False, lang="en"):
@@ -193,18 +216,38 @@ def fix_value(value, glossary, use_language_tool=False, lang="en"):
         cats.append("Punctuation (double period)")
         v = deperiod
 
-    # Don't blindly uppercase the first letter if the first word is a
+    # Don't blindly uppercase a letter if the word starting right there is a
     # custom-dictionary term with deliberate internal casing (e.g. "iPAS",
     # "macOS") - doing so corrupts it (e.g. "iPAS" -> "IPAS"). Found via
     # MRG's explicit "leave iPAS as is" instruction, 2026-08-25.
     from core.spellcheck import get_mixed_case_custom_words
-    first_word_match = re.match(r"[A-Za-z][A-Za-z0-9']*", v)
-    first_word = first_word_match.group(0) if first_word_match else ""
-    first_word_protected = first_word in get_mixed_case_custom_words()
+    mixed_case_words_for_cap = get_mixed_case_custom_words()
 
+    # Capitalize the start of EVERY sentence, not just the first one in the
+    # string. BUG FIX: this used to only ever touch v[0] - a lowercase
+    # letter starting the second (or later) sentence of a multi-sentence
+    # string (e.g. "Confirm the order. please proceed") was silently never
+    # fixed. Only position 0 needs the "looks_like_sentence" gate (a short
+    # 1-2 word label starting lowercase may be intentional); any position
+    # right after an already-confirmed ". "/"! "/"? " boundary is
+    # unambiguous on its own. The `cats` note is only added when the
+    # ORIGINAL value actually had this issue somewhere, same discipline as
+    # every other fix in this function.
     looks_like_sentence = len(v.split()) >= 3 or v.rstrip().endswith((".", "!", "?", ":"))
-    if v and looks_like_sentence and v[0].islower() and v[0].isalpha() and not first_word_protected:
-        v = v[0].upper() + v[1:]
+
+    def _cap_sentence_start(m):
+        start = m.start(1)
+        if start == 0 and not looks_like_sentence:
+            return m.group(0)
+        word_match = re.match(r"[A-Za-z][A-Za-z0-9']*", v[start:])
+        word = word_match.group(0) if word_match else ""
+        if word in mixed_case_words_for_cap:
+            return m.group(0)
+        return m.group(0)[:-1] + m.group(1).upper()
+
+    capitalized = re.sub(r"(?:^|[.!?]\s+)([a-z])", _cap_sentence_start, v)
+    if capitalized != v:
+        v = capitalized
         cats.append("Grammar (capitalize sentence start)")
 
     # Mixed Title-Case/sentence-case fix - MRG's explicit choice (2026-08-27,
@@ -247,7 +290,11 @@ def fix_value(value, glossary, use_language_tool=False, lang="en"):
                     v = corrected
 
     from core.spellcheck import fix_spelling, get_custom_words
-    spelled = fix_spelling(v, lang, get_custom_words())
+    # Glossary keys (e.g. "ccp") are known abbreviations, already handled by
+    # the Terminology step above - skip them here too so spelling never
+    # overwrites one with an unrelated dictionary guess (e.g. "ccp" -> "cp").
+    spelling_skip_words = get_custom_words() | ({k.lower() for k in glossary} if glossary else set())
+    spelled = fix_spelling(v, lang, spelling_skip_words)
     if spelled != v:
         cats.append("Spelling (dictionary correction)")
         v = spelled

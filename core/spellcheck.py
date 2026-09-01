@@ -84,14 +84,38 @@ def _try_camelcase_split(word, lib, h):
     - hunspell can't recognize the compound and its raw suggestion is often
     an unrelated real word (e.g. 'Pallette'). If splitting at the first
     lowercase->uppercase boundary yields two valid dictionary words, that
-    split IS the fix - far more reliable than a generic suggestion here."""
+    split IS the fix - far more reliable than a generic suggestion here.
+    Requires each half to be at least 4 letters - a short fragment either
+    side (e.g. 'en' + 'Ter' from 'enTer') is far more likely a single word
+    with one stray capital letter than two real words glued together; see
+    `_try_stray_capital_fix`, which is tried first and handles that case."""
     m = re.search(r"[a-z][A-Z]", word)
     if not m:
         return None
     split_at = m.start() + 1
     left, right = word[:split_at], word[split_at:]
+    if len(left) < 4 or len(right) < 4:
+        return None
     if lib.Hunspell_spell(h, left.encode("utf-8")) and lib.Hunspell_spell(h, right.encode("utf-8")):
         return f"{left} {right}"
+    return None
+
+
+def _try_stray_capital_fix(word, lib, h):
+    """A word with an unexpected capital letter somewhere after the first
+    character (e.g. 'enTer') is almost always a single word typed with a
+    stray capital, not two words glued together. If lowercasing the whole
+    word yields a real dictionary word, that is a far safer, more targeted
+    fix than guessing a two-word split - checked before any split is
+    attempted. Verified directly: without this, 'enTer' matched the
+    camelCase-split boundary ('en' + 'Ter', both individually valid
+    dictionary entries) and produced the nonsensical 'en Ter' instead of the
+    obviously-intended 'enter'."""
+    if len(word) < 2 or not any(c.isupper() for c in word[1:]):
+        return None
+    lowered = word.lower()
+    if lib.Hunspell_spell(h, lowered.encode("utf-8")):
+        return lowered
     return None
 
 
@@ -102,14 +126,55 @@ def _try_lowercase_compound_split(word, lib, h):
     real dictionary words of at least 3 letters (avoids nonsense splits like
     't' + 'aginfo'). Only used as a fallback when camelCase splitting found
     nothing, and only for words long enough that a real 2-word split makes
-    sense (6+ letters)."""
+    sense (6+ letters).
+
+    Only returns a split when exactly ONE split point is valid. A word like
+    'groupset' has two: 'gro'+'upset' AND 'group'+'set' - with no way to
+    know which one is intended, blindly picking the first one found (as this
+    used to) produced the nonsensical 'gro upset'. When the split is
+    ambiguous like this, the word is most likely a real compound term simply
+    missing from the dictionary (see `custom_dictionary.txt`) rather than
+    two words missing a space, so no split is offered at all."""
     if len(word) < 6 or not word.islower():
         return None
+    candidates = []
     for i in range(3, len(word) - 2):
         left, right = word[:i], word[i:]
         if lib.Hunspell_spell(h, left.encode("utf-8")) and lib.Hunspell_spell(h, right.encode("utf-8")):
-            return f"{left} {right}"
+            candidates.append(f"{left} {right}")
+    if len(candidates) == 1:
+        return candidates[0]
     return None
+
+
+# Common English derivational prefixes. A word not recognized as a single
+# dictionary entry may still be a completely standard compound: one of these
+# prefixes attached directly to a real base word (e.g. 'underdosed' = under +
+# dosed, 'premixture' = pre + mixture, 'inprogress' = in + progress). This is
+# a GENERAL rule, not a per-word list - it is what stops the checker from
+# "correcting" this whole class of word into something meaning-changing
+# (e.g. 'inprogress' -> 'progress', which silently drops the very prefix
+# that carries the word's meaning) instead of leaving it alone. Sorted
+# longest-first when matched so e.g. 'undermine' checks against 'under'
+# before the shorter 'un' could apply.
+_DERIVATIONAL_PREFIXES = tuple(sorted([
+    "counter", "inter", "under", "over", "semi", "multi", "auto", "anti",
+    "post", "non", "pre", "sub", "mis", "dis", "re", "un", "in", "co", "de",
+], key=len, reverse=True))
+
+
+def _is_valid_prefixed_compound(word, lib, h):
+    """True if `word` is a recognized derivational prefix directly followed
+    by a real dictionary word (see `_DERIVATIONAL_PREFIXES`) - i.e. it's
+    standard English, just not present as its own dictionary entry, and
+    should be treated as correctly spelled rather than flagged at all."""
+    wl = word.lower()
+    for p in _DERIVATIONAL_PREFIXES:
+        if wl.startswith(p) and len(wl) - len(p) >= 3:
+            rest = wl[len(p):]
+            if lib.Hunspell_spell(h, rest.encode("utf-8")):
+                return True
+    return False
 
 
 _WORD_RE = re.compile(r"[A-Za-z']+")
@@ -339,12 +404,21 @@ def check_spelling(value, lang, custom_words=None):
             continue
         ok = lib.Hunspell_spell(h, word.encode("utf-8"))
         if not ok:
+            if _is_valid_prefixed_compound(word, lib, h):
+                # Standard prefix + real base word (see
+                # _is_valid_prefixed_compound) - correctly spelled as one
+                # word, not a misspelling at all.
+                continue
             known_fix = CONTRACTION_FIXES.get(word.lower()) or KNOWN_TYPO_FIXES.get(word.lower())
             if known_fix:
                 # Known contraction or hand-verified typo - use directly,
                 # skip hunspell's raw suggestions entirely (they're
                 # unreliable for exactly these typo classes, see notes above).
                 results.append((word, [known_fix], True))
+                continue
+            stray_cap_fix = _try_stray_capital_fix(word, lib, h)
+            if stray_cap_fix:
+                results.append((word, [stray_cap_fix], True))
                 continue
             camel_split = _try_camelcase_split(word, lib, h)
             if camel_split:
