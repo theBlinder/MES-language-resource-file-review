@@ -140,7 +140,14 @@ def check_entry(value, lang="en", glossary=None):
     # real find from this team's actual files - e.g. "No Images found",
     # "Quantity reverted Successfully". Conservative: only fires when BOTH
     # patterns appear among content words (excludes minor words: of/the/a/
-    # in/to/and/or/is/are/was/were/by/on/at/as/per/vs/nor/but).
+    # in/to/and/or/is/are/was/were/by/on/at/as/per/vs/nor/but). A string
+    # written ENTIRELY in Title Case (every eligible word capitalized, no
+    # mix) is flagged separately below - a normal UI sentence/message should
+    # use sentence case, only the first word and any defined multi-word
+    # terminology capitalized (see `_protected_phrase_spans` in
+    # core/engine.py) - real example: "Oven Capacity Limit Exceeds the
+    # Maximum Number of Baking Activities Allowed in Parallel for Selected
+    # Oven".
     if lang in ("en", "unknown"):
         _MINOR_WORDS = {"of", "the", "a", "an", "in", "to", "and", "or", "is",
                          "are", "was", "were", "by", "on", "at", "as", "per",
@@ -152,29 +159,41 @@ def check_entry(value, lang="en", glossary=None):
         # (. ! ? followed by a capital letter) is present.
         has_multiple_sentences = bool(re.search(r"[.!?]\s+[A-Z]", v))
         v_for_case_check = re.sub(r"\bNo\.\s*", "", v)
-        content_words = [w for w in re.findall(r"[A-Za-z']+", v_for_case_check) if w.lower() not in _MINOR_WORDS and len(w) > 1]
-        if len(content_words) >= 3 and not has_multiple_sentences:
+        from core.engine import _protected_phrase_spans, _in_span
+        phrase_spans = _protected_phrase_spans(v_for_case_check, active_glossary)
+        content_matches = [m for m in re.finditer(r"[A-Za-z']+", v_for_case_check)
+                            if m.group(0).lower() not in _MINOR_WORDS and len(m.group(0)) > 1]
+        if len(content_matches) >= 3 and not has_multiple_sentences:
             # skip the first word (sentence/title start is always capitalized either way)
-            rest = content_words[1:]
-            # An ALL-CAPS acronym (e.g. "LAB") or a protected custom-
-            # dictionary/glossary term (e.g. "Vegam", "DRL") is not evidence
-            # of a real casing inconsistency either way - excluded from the
-            # vote entirely, same set `_fix_mixed_case_casing` in engine.py
-            # treats as exempt, so detection and fixing never disagree on
-            # what counts as "inconsistent" here.
+            rest_matches = content_matches[1:]
+            # An ALL-CAPS acronym (e.g. "LAB"), a protected custom-
+            # dictionary/glossary term (e.g. "Vegam", "DRL"), or a word that's
+            # part of a defined multi-word terminology phrase (e.g. "Order"
+            # inside "Order Number") is not evidence of a real casing
+            # inconsistency either way - excluded from the vote entirely,
+            # same exemption `_fix_mixed_case_casing` in engine.py uses, so
+            # detection and fixing never disagree on what counts as
+            # "inconsistent" here.
             from core.spellcheck import get_custom_words
             custom_words = get_custom_words()
-            protected_terms = {k.lower() for k in active_glossary} | {str(x).lower() for x in active_glossary.values()}
+            protected_terms = {k.lower() for k in active_glossary if " " not in k} | \
+                {str(x).lower() for k, x in active_glossary.items() if " " not in k}
 
             def _is_exempt(w):
                 return w.isupper() or w.lower() in custom_words or w.lower() in protected_terms
 
-            votable = [w for w in rest if not _is_exempt(w)]
+            votable = [m.group(0) for m in rest_matches
+                       if not _is_exempt(m.group(0)) and not _in_span(m.start(), phrase_spans)]
             has_cap = any(w[:1].isupper() and not w.isupper() for w in votable)
             has_lower = any(w[:1].islower() for w in votable)
             if has_cap and has_lower:
                 issues["Grammar"].append(
                     "Inconsistent capitalization - mixes Title Case and sentence case within the same string"
+                )
+            elif has_cap and not has_lower:
+                issues["Grammar"].append(
+                    "Sentence is written in Title Case - normal UI sentences should use sentence case "
+                    "(capitalize only the first word and any defined terminology)"
                 )
 
     words = v.split()

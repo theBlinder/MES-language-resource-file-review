@@ -69,6 +69,38 @@ _MINOR_WORDS_CASING = {"of", "the", "a", "an", "in", "to", "and", "or", "is",
                         "vs", "nor", "but", "for"}
 
 
+def _protected_phrase_spans(v, glossary):
+    """Character spans in `v` covered by a multi-word defined-terminology
+    phrase from `glossary` (any key containing a space, e.g. "order number"
+    -> "Order Number") - matched case-insensitively, longest phrase first so
+    a longer defined term always wins over a shorter one it happens to
+    contain (e.g. "Application Order" over a bare "Application"). A word
+    inside one of these spans must never count as evidence of "inconsistent"
+    or "Title Case" casing in the sentence-casing checks below - a defined
+    multi-word term's casing is deliberate, not a style choice - and must
+    never be recased by `_fix_mixed_case_casing`. It's safe to just leave
+    these spans untouched there rather than actively re-casing them to their
+    canonical form: the glossary substitution step later in fix_value()
+    already handles multi-word phrases via this same word-boundary-regex
+    mechanism and runs AFTER the sentence-casing fix, so it restores the
+    exact canonical casing regardless of what (if anything) happened to the
+    phrase's words in this earlier step. Keep in sync with the same-purpose
+    helper in docs/index.html."""
+    phrases = sorted((k for k in (glossary or {}) if " " in k), key=len, reverse=True)
+    if not phrases:
+        return []
+    pattern = r"\b(?:" + "|".join(re.escape(p) for p in phrases) + r")\b"
+    spans = []
+    for m in re.finditer(pattern, v, flags=re.IGNORECASE):
+        if not any(s < m.end() and m.start() < e for s, e in spans):
+            spans.append((m.start(), m.end()))
+    return spans
+
+
+def _in_span(pos, spans):
+    return any(s <= pos < e for s, e in spans)
+
+
 def _fix_mixed_case_casing(v, glossary):
     """Fixing counterpart to check_entry()'s "Inconsistent capitalization"
     Grammar detection in language_rules.py - that function only DETECTS the
@@ -90,20 +122,42 @@ def _fix_mixed_case_casing(v, glossary):
     real style, and only the minority OUTLIER words get converted to match
     it; a word that's already consistent with the majority is never
     touched, regardless of its own case. A tie defaults to sentence case
-    (this function's long-standing default direction)."""
+    (this function's long-standing default direction).
+
+    Also handles the separate case of a string written ENTIRELY in Title
+    Case (every eligible word capitalized, no mix at all) - majority vote
+    alone would call that "no problem" (100% agreement), but a normal UI
+    sentence/message written throughout in Title Case is itself the issue
+    MRG reported (e.g. "Oven Capacity Limit Exceeds the Maximum Number of
+    Baking Activities Allowed in Parallel for Selected Oven"). When there's
+    no lowercase word to vote against, sentence case is FORCED as the
+    target rather than derived from the vote - see the `low_count` check
+    below.
+
+    A defined multi-word terminology phrase (e.g. "Order Number", "Handover
+    Bin" - see `_protected_phrase_spans`) is excluded from the vote entirely
+    and never recased here, same treatment as a single protected/exempt
+    word - its casing is required, not a style choice, regardless of what
+    the rest of the sentence does."""
     has_multiple_sentences = bool(re.search(r"[.!?]\s+[A-Z]", v))
     if has_multiple_sentences:
         return v
     v_for_case = re.sub(r"\bNo\.\s*", "", v)
-    content = [w for w in re.findall(r"[A-Za-z']+", v_for_case)
-               if w.lower() not in _MINOR_WORDS_CASING and len(w) > 1]
-    if len(content) < 3:
+    phrase_spans_for_case = _protected_phrase_spans(v_for_case, glossary)
+    content_matches = [m for m in re.finditer(r"[A-Za-z']+", v_for_case)
+                        if m.group(0).lower() not in _MINOR_WORDS_CASING and len(m.group(0)) > 1]
+    if len(content_matches) < 3:
         return v
-    rest = content[1:]
+    rest_matches = content_matches[1:]
 
     from core.spellcheck import get_custom_words
     custom_words = get_custom_words()
-    protected = {k.lower() for k in (glossary or {})} | {str(x).lower() for x in (glossary or {}).values()}
+    # Only single-word glossary entries here - multi-word phrases are
+    # handled separately via `_protected_phrase_spans` above, since a phrase
+    # is a defined TERM (protect every word in it, positionally), not a
+    # single exempt token.
+    protected = {k.lower() for k in (glossary or {}) if " " not in k} | \
+        {str(x).lower() for k, x in (glossary or {}).items() if " " not in k}
 
     def _is_exempt(w):
         # ALL-CAPS acronym (e.g. "LAB") or a protected custom-dictionary/
@@ -111,15 +165,17 @@ def _fix_mixed_case_casing(v, glossary):
         # never counts as evidence either way, nor is it ever changed.
         return w.isupper() or w.lower() in custom_words or w.lower() in protected
 
-    votable = [w for w in rest if not _is_exempt(w)]
+    votable = [m.group(0) for m in rest_matches
+               if not _is_exempt(m.group(0)) and not _in_span(m.start(), phrase_spans_for_case)]
     cap_count = sum(1 for w in votable if w[:1].isupper() and not w.isupper())
     low_count = sum(1 for w in votable if w[:1].islower())
-    if cap_count == 0 or low_count == 0:
-        return v  # no real mix among the words actually eligible to change
+    if cap_count == 0:
+        return v  # nothing capitalized among the words eligible to change - no fix needed
 
-    target_is_title = cap_count > low_count
+    target_is_title = (cap_count > low_count) if low_count else False
 
     seen_first_content_word = [False]
+    phrase_spans_v = _protected_phrase_spans(v, glossary)
 
     def _recase(m):
         word = m.group(0)
@@ -128,8 +184,8 @@ def _fix_mixed_case_casing(v, glossary):
         if not seen_first_content_word[0]:
             seen_first_content_word[0] = True
             return word  # never touch the first content word
-        if _is_exempt(word):
-            return word  # protected/acronym - casing is deliberate
+        if _in_span(m.start(), phrase_spans_v) or _is_exempt(word):
+            return word  # defined multi-word term, or protected/acronym - casing is deliberate
         is_title = word[:1].isupper() and not word.isupper()
         if target_is_title and not is_title:
             return word[:1].upper() + word[1:]

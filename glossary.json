@@ -8,5 +8,10 @@
   "sscc": "SSCC",
   "drl": "DRL",
   "idh": "IDH",
-  "ccp": "CCP"
+  "ccp": "CCP",
+  "application order": "Application Order",
+  "application line": "Application Line",
+  "handover bin": "Handover Bin",
+  "order number": "Order Number",
+  "barcode id": "Barcode ID"
 }

@@ -148,6 +148,7 @@
     border: 1.5px solid var(--flag); background: var(--flag-bg);
     border-radius: 10px; font-size: 13px; color: var(--ink);
   }
+  .download-warning .warning-actions { margin-top: 8px; }
 
   a.btn-ghost {
     color: var(--muted); text-decoration: none;
@@ -199,7 +200,6 @@
         </select>
       </label>
       <div class="langnote" id="langNote"></div>
-      <div class="download-warning" id="undownloadedNote" style="display:none;"></div>
 
       <button id="runBtn" disabled>Run QA check</button>
       <div class="status" id="statusMsg"></div>
@@ -209,6 +209,12 @@
     <section class="card" id="results">
       <div class="filename" id="resultFilename"></div>
       <div class="stamps" id="summaryCards"></div>
+      <div class="download-warning" id="undownloadedNote" style="display:none;">
+        Your previous Excel report has not been downloaded. Please download it before checking another file.
+        <div class="warning-actions">
+          <a class="btn-ghost" id="continueAnywayBtn">Continue without downloading →</a>
+        </div>
+      </div>
       <div class="results-actions">
         <button id="downloadBtn">Download Excel report</button>
         <a class="btn-ghost" id="resetBtn">← Check another file</a>
@@ -224,7 +230,11 @@ const KNOWN_LANG_CODES = {
   ru: "Russian", ja: "Japanese", zh: "Chinese", ko: "Korean", ar: "Arabic", hi: "Hindi"
 };
 const SPACE_BEFORE_PUNCT_LANGS = new Set(["fr"]);
-const GLOSSARY = { ip: "IP", sop: "SOP", hu: "HU", po: "PO", fg: "FG", qc: "QC", sscc: "SSCC", drl: "DRL", idh: "IDH", ccp: "CCP" };
+const GLOSSARY = {
+  ip: "IP", sop: "SOP", hu: "HU", po: "PO", fg: "FG", qc: "QC", sscc: "SSCC", drl: "DRL", idh: "IDH", ccp: "CCP",
+  "application order": "Application Order", "application line": "Application Line",
+  "handover bin": "Handover Bin", "order number": "Order Number", "barcode id": "Barcode ID",
+};
 // Hunspell dictionaries only meaningfully exist / apply for space-delimited languages.
 // CJK (zh, ja, ko) need word-segmentation-based tooling, not Hunspell - not attempted here.
 // Dictionaries are bundled in docs/dictionaries/ (same-origin) rather than fetched from
@@ -633,6 +643,37 @@ function spellCheckValue(value, dict, customWords) {
 // over the same mutating `v`, the gap was already gone and the Spacing
 // issue was silently lost. Keep this function in sync with check_entry() in
 // core/language_rules.py - same checks, same order, same gates.
+
+// Character spans in `v` covered by a multi-word defined-terminology phrase
+// from GLOSSARY (any key containing a space, e.g. "order number" -> "Order
+// Number") - matched case-insensitively, longest phrase first so a longer
+// defined term always wins over a shorter one it happens to contain. A word
+// inside one of these spans must never count as evidence of "inconsistent"
+// casing in the sentence-casing checks below - a defined multi-word term's
+// casing is deliberate, not a style choice - and must never be recased by
+// structuralFix's mixed-case fix. It's safe to just leave these spans
+// untouched there: the glossary substitution step later in structuralFix
+// already handles multi-word phrases via this same word-boundary-regex
+// mechanism and runs AFTER the sentence-casing fix, so it restores the
+// exact canonical casing regardless of what (if anything) happened to the
+// phrase's words in this earlier step. Keep in sync with
+// _protected_phrase_spans() in core/engine.py.
+function protectedPhraseSpans(v) {
+  const phrases = Object.keys(GLOSSARY).filter(k => k.includes(" ")).sort((a, b) => b.length - a.length);
+  if (!phrases.length) return [];
+  const pattern = new RegExp("\\b(?:" + phrases.map(p => p.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")).join("|") + ")\\b", "gi");
+  const spans = [];
+  for (const m of v.matchAll(pattern)) {
+    const start = m.index, end = m.index + m[0].length;
+    if (!spans.some(([s, e]) => s < end && start < e)) spans.push([start, end]);
+  }
+  return spans;
+}
+
+function inSpan(pos, spans) {
+  return spans.some(([s, e]) => s <= pos && pos < e);
+}
+
 function checkEntry(value, lang, mixedCaseWords, customWordsForCasing) {
   mixedCaseWords = mixedCaseWords || new Set();
   customWordsForCasing = customWordsForCasing || new Set();
@@ -718,15 +759,19 @@ function checkEntry(value, lang, mixedCaseWords, customWordsForCasing) {
     const MINOR_WORDS = new Set(["of", "the", "a", "an", "in", "to", "and", "or", "is", "are", "was", "were", "by", "on", "at", "as", "per", "vs", "nor", "but", "for"]);
     const hasMultipleSentences = /[.!?]\s+[A-Z]/.test(v);
     const vForCase = v.replace(/\bNo\.\s*/g, "");
-    const contentWords = (vForCase.match(/[A-Za-z']+/g) || []).filter(w => !MINOR_WORDS.has(w.toLowerCase()) && w.length > 1);
-    if (contentWords.length >= 3 && !hasMultipleSentences) {
-      const rest = contentWords.slice(1);
+    const phraseSpans = protectedPhraseSpans(vForCase);
+    const contentMatches = [...vForCase.matchAll(/[A-Za-z']+/g)].filter(m => !MINOR_WORDS.has(m[0].toLowerCase()) && m[0].length > 1);
+    if (contentMatches.length >= 3 && !hasMultipleSentences) {
+      const restMatches = contentMatches.slice(1);
+      // Single-word glossary entries only - multi-word phrases are handled
+      // separately via phraseSpans above, since a phrase is a defined TERM
+      // (protect every word in it, positionally), not a single exempt token.
       const protectedWords = new Set([
-        ...Object.keys(GLOSSARY),
-        ...Object.values(GLOSSARY).map(x => String(x).toLowerCase()),
+        ...Object.keys(GLOSSARY).filter(k => !k.includes(" ")),
+        ...Object.values(GLOSSARY).filter(v => !String(v).includes(" ")).map(x => String(x).toLowerCase()),
       ]);
       const isExempt = (w) => w === w.toUpperCase() || customWordsForCasing.has(w.toLowerCase()) || protectedWords.has(w.toLowerCase()) || mixedCaseWords.has(w);
-      const votable = rest.filter(w => !isExempt(w));
+      const votable = restMatches.filter(m => !isExempt(m[0]) && !inSpan(m.index, phraseSpans)).map(m => m[0]);
       const hasCap = votable.some(w => /^[A-Z]/.test(w) && w !== w.toUpperCase());
       const hasLower = votable.some(w => /^[a-z]/.test(w));
       if (hasCap && hasLower) {
@@ -911,25 +956,30 @@ function structuralFix(value, lang, mixedCaseWords, customWordsForCasing) {
     const MINOR_WORDS = new Set(["of","the","a","an","in","to","and","or","is","are","was","were","by","on","at","as","per","vs","nor","but","for"]);
     const hasMultipleSentences = /[.!?]\s+[A-Z]/.test(value);
     const vForCase = value.replace(/\bNo\.\s*/g, "");
-    const contentWords = (vForCase.match(/[A-Za-z']+/g) || []).filter(w => !MINOR_WORDS.has(w.toLowerCase()) && w.length > 1);
-    if (contentWords.length >= 3 && !hasMultipleSentences) {
-      const rest = contentWords.slice(1);
+    const phraseSpansForCase = protectedPhraseSpans(vForCase);
+    const contentMatches = [...vForCase.matchAll(/[A-Za-z']+/g)].filter(m => !MINOR_WORDS.has(m[0].toLowerCase()) && m[0].length > 1);
+    if (contentMatches.length >= 3 && !hasMultipleSentences) {
+      const restMatches = contentMatches.slice(1);
+      // Single-word glossary entries only - multi-word phrases are handled
+      // separately via phraseSpans, since a phrase is a defined TERM
+      // (protect every word in it, positionally), not a single exempt token.
       const protectedWords = new Set([
-        ...Object.keys(GLOSSARY),
-        ...Object.values(GLOSSARY).map(x => String(x).toLowerCase()),
+        ...Object.keys(GLOSSARY).filter(k => !k.includes(" ")),
+        ...Object.values(GLOSSARY).filter(v => !String(v).includes(" ")).map(x => String(x).toLowerCase()),
       ]);
       const isExempt = (w) => w === w.toUpperCase() || customWordsForCasing.has(w.toLowerCase()) || protectedWords.has(w.toLowerCase()) || mixedCaseWords.has(w);
-      const votable = rest.filter(w => !isExempt(w));
+      const votable = restMatches.filter(m => !isExempt(m[0]) && !inSpan(m.index, phraseSpansForCase)).map(m => m[0]);
       const capCount = votable.filter(w => /^[A-Z]/.test(w) && w !== w.toUpperCase()).length;
       const lowCount = votable.filter(w => /^[a-z]/.test(w)).length;
       if (capCount > 0 && lowCount > 0) {
         cats.push("Grammar: inconsistent capitalization (mixes Title Case and sentence case)");
         const targetIsTitle = capCount > lowCount;
         let seenFirstContentWord = false;
-        v = v.replace(/[A-Za-z']+/g, (word) => {
+        const phraseSpansV = protectedPhraseSpans(v);
+        v = v.replace(/[A-Za-z']+/g, (word, offset) => {
           if (MINOR_WORDS.has(word.toLowerCase()) || word.length <= 1) return word;
           if (!seenFirstContentWord) { seenFirstContentWord = true; return word; }
-          if (isExempt(word)) return word;
+          if (inSpan(offset, phraseSpansV) || isExempt(word)) return word;
           const isTitle = /^[A-Z]/.test(word) && word !== word.toUpperCase();
           if (targetIsTitle && !isTitle) return word[0].toUpperCase() + word.slice(1);
           if (!targetIsTitle && isTitle) return word[0].toLowerCase() + word.slice(1);
@@ -991,7 +1041,24 @@ async function buildWorkbook(filename, entries, lang) {
   // independent of hunspell dictionary availability.
   const customWords = await loadCustomWords();
   if (spellingSupported) {
-    dict = await loadDictionary(lang.code);
+    // loadDictionary() already catches its own fetch/parse errors and
+    // resolves to null rather than throwing - but that contract is only as
+    // good as that function staying bug-free. This try/catch is a second,
+    // independent safety net: NOTHING that can go wrong while loading the
+    // spelling dictionary may ever propagate out of this function and abort
+    // the rest of buildWorkbook (Grammar/Spacing/Terminology detection,
+    // still to come below, does not depend on `dict` at all - see the
+    // comment on `customWords` above). Without this, an unexpected
+    // exception here (present or future) would silently kill the ENTIRE
+    // report - no Grammar, no Spacing, no Terminology, nothing - which is
+    // exactly the class of bug MRG reported (spelling dictionary failing
+    // appearing to also take grammar checking down with it).
+    try {
+      dict = await loadDictionary(lang.code);
+    } catch (err) {
+      console.error("Dictionary load threw unexpectedly - continuing without spelling", err);
+      dict = null;
+    }
     if (!dict) dictError = true;
   }
 
@@ -1030,10 +1097,23 @@ async function buildWorkbook(filename, entries, lang) {
       // lower-priority sheet is left. This mirrors the Python side, where
       // check_entry's spelling check always runs against the untouched
       // original value, independent of every other check.
-      spellIssues = spellCheckValue(e.value, dict, spellingSkipWords).issues;
-      // The corrected TEXT shown in "Suggested Change" still chains every
-      // fix together (structural fixes, then spelling) same as before.
-      fullyCorrected = spellCheckValue(structFixed, dict, spellingSkipWords).corrected;
+      //
+      // Isolated in its own try/catch: this runs inside entries.forEach, so
+      // an exception here (e.g. a single malformed string tripping up the
+      // Typo dictionary) would otherwise propagate out of the WHOLE forEach
+      // and abort every check - Spelling, Spacing, Grammar, Terminology -
+      // for every entry, not just this one. A spelling-only failure must
+      // stay a spelling-only failure for this one string.
+      try {
+        spellIssues = spellCheckValue(e.value, dict, spellingSkipWords).issues;
+        // The corrected TEXT shown in "Suggested Change" still chains every
+        // fix together (structural fixes, then spelling) same as before.
+        fullyCorrected = spellCheckValue(structFixed, dict, spellingSkipWords).corrected;
+      } catch (err) {
+        console.error(`Spelling check failed for "${e.key}" (line ${e.line}) - skipping spelling for this string only`, err);
+        spellIssues = [];
+        fullyCorrected = structFixed;
+      }
     }
 
     // DETECTION/ROUTING - independent per category, always against the
@@ -1127,9 +1207,11 @@ let currentFile = null;
 // Tracks whether the CURRENT report (the one shown on screen right now) has
 // been downloaded yet - reset to false every time a new report is
 // generated, set to true only when the download button is actually clicked.
-// "Check another file" checks this and surfaces a non-blocking reminder if
-// not - see resetBtn handler below. This never stops the user from moving
-// on to the next file; it only makes sure they're told.
+// "Check another file" checks this: if not yet downloaded, it stays on THIS
+// results page (report + download button still visible/usable) and shows a
+// warning instead of navigating away - see resetBtn handler below. Only
+// navigates to the upload panel once the user downloads or explicitly
+// chooses to continue without it.
 let reportDownloaded = false;
 const dropzone = document.getElementById("dropzone");
 const fileInput = document.getElementById("fileInput");
@@ -1169,6 +1251,7 @@ document.getElementById("runBtn").addEventListener("click", async () => {
 
   const reader = new FileReader();
   reader.onload = async (evt) => {
+   try {
     const entries = parseEntries(evt.target.result);
     const lang = manual === "auto" ? detectLanguage(currentFile.name) : { code: manual, name: KNOWN_LANG_CODES[manual] || manual, method: "manual" };
 
@@ -1176,10 +1259,10 @@ document.getElementById("runBtn").addEventListener("click", async () => {
 
     if (NO_SPELLCHECK_SUPPORT.has(lang.code)) {
       statusEl.className = "status error";
-      statusEl.textContent = `Note: dictionary spelling check is not supported for ${lang.name} - Spelling sheet will be empty. Other checks still ran.`;
+      statusEl.textContent = `Note: dictionary spelling check is not supported for ${lang.name} - Spelling sheet will be empty. Other checks (Spacing, Grammar, Terminology) still ran normally.`;
     } else if (dictError) {
       statusEl.className = "status error";
-      statusEl.textContent = `Note: spelling dictionary failed to load (check your internet connection) - Spelling sheet is empty this run.`;
+      statusEl.textContent = `Note: spelling dictionary failed to load (check your internet connection) - Spelling sheet is empty this run. Other checks (Spacing, Grammar, Terminology) still ran normally.`;
     } else {
       statusEl.textContent = "";
     }
@@ -1203,6 +1286,9 @@ document.getElementById("runBtn").addEventListener("click", async () => {
     document.getElementById("downloadBtn").onclick = () => {
       XLSX.writeFile(wb, outName);
       reportDownloaded = true;
+      // The warning (if it was showing from a previous, still-undownloaded
+      // report) is now moot - this one just got downloaded.
+      document.getElementById("undownloadedNote").style.display = "none";
     };
     // Swap panels rather than stacking the report below the upload form -
     // this is a one-upload-one-download flow, so only one panel needs to
@@ -1210,26 +1296,29 @@ document.getElementById("runBtn").addEventListener("click", async () => {
     // instead of growing taller with every run).
     document.getElementById("uploadPanel").style.display = "none";
     document.getElementById("results").style.display = "block";
+   } catch (err) {
+    // Last-resort safety net: every known failure point above (dictionary
+    // load, per-string spelling check) already catches its own errors and
+    // degrades gracefully rather than reaching here - see buildWorkbook().
+    // If something still slips through, fail LOUDLY instead of leaving the
+    // button stuck on "Checking..." forever with no explanation, which is
+    // indistinguishable from "grammar/everything silently stopped working".
+    console.error("QA check failed unexpectedly", err);
+    statusEl.className = "status error";
+    statusEl.textContent = `Something went wrong while checking this file (${err.message || err}) - see the browser console for details. Nothing was generated; please try again.`;
+   } finally {
     runBtn.disabled = false;
+   }
   };
   reader.readAsText(currentFile);
 });
 
-// "Check another file" - resets back to the upload panel without a full
-// page reload, so a second file doesn't require re-fetching the dictionary.
-// Only one report is ever kept "live" (the in-memory workbook + download
-// button get overwritten by the next run) - if the current one hasn't been
-// downloaded yet, this surfaces a reminder on the upload panel, but never
-// blocks moving on to the next file.
-function goToUploadPanel(undownloadedNote) {
-  const noteEl = document.getElementById("undownloadedNote");
-  if (undownloadedNote) {
-    noteEl.textContent = undownloadedNote;
-    noteEl.style.display = "block";
-  } else {
-    noteEl.style.display = "none";
-    noteEl.textContent = "";
-  }
+// Resets back to the upload panel without a full page reload, so a second
+// file doesn't require re-fetching the dictionary. Only one report is ever
+// kept "live" (the in-memory workbook + download button get overwritten by
+// the next run).
+function goToUploadPanel() {
+  document.getElementById("undownloadedNote").style.display = "none";
   currentFile = null;
   fileInput.value = "";
   document.getElementById("dzFile").textContent = "";
@@ -1241,12 +1330,22 @@ function goToUploadPanel(undownloadedNote) {
   document.getElementById("uploadPanel").style.display = "block";
 }
 
+// "Check another file" - if the report currently on screen hasn't been
+// downloaded yet, this must NOT navigate away: it shows the warning right
+// here on the results page (report + download button both stay visible and
+// usable) and waits for the user to either download it or explicitly
+// choose to continue without it. Only a report that's already been
+// downloaded skips straight to the upload panel with no interruption.
 document.getElementById("resetBtn").addEventListener("click", () => {
-  const prevName = document.getElementById("resultFilename").textContent;
-  const note = reportDownloaded
-    ? null
-    : `Your previous Excel report ("${prevName}") was not downloaded and will no longer be available once you check another file.`;
-  goToUploadPanel(note);
+  if (reportDownloaded) {
+    goToUploadPanel();
+    return;
+  }
+  document.getElementById("undownloadedNote").style.display = "block";
+});
+
+document.getElementById("continueAnywayBtn").addEventListener("click", () => {
+  goToUploadPanel();
 });
 </script>
 </body>
