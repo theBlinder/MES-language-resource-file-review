@@ -220,6 +220,14 @@ REAL_WORD_TYPO_FIXES = {
     # curated entry for one specific, verified case. Keep in sync with
     # REAL_WORD_TYPO_FIXES in docs/index.html.
     "sech": "search",
+    # MRG's real reported examples (2026-09-01): "Formula already exits for
+    # material", "Material does not exits", "Formula name already exits" -
+    # "exits" (plural of the noun "exit", or the verb "to exit") is a real
+    # dictionary word, but in every one of these UI-message contexts the
+    # intended word is clearly "exists". Same discipline as "caned"/"pleas"/
+    # "sech" above - one curated entry for a specific, verified case. Keep
+    # in sync with REAL_WORD_TYPO_FIXES in docs/index.html.
+    "exits": "exists",
 }
 
 # Exact-typo -> definitely-correct-fix overrides, for cases where BOTH
@@ -267,6 +275,23 @@ KNOWN_TYPO_FIXES = {
 ACCEPTED_SPELLING_VARIANTS = {
     "cancelled",
 }
+
+
+def _levenshtein(a, b):
+    """Real edit distance (insert/delete/substitute), not just a length-diff
+    proxy - needed to safely gate raw dictionary suggestions against a
+    compound-word split below (see check_spelling): a length-diff check
+    alone can't tell "relevent"->"relevant" (one substitution, genuinely
+    close) apart from "taginfo"->"tagging" (same length, but a different
+    word throughout)."""
+    m, n = len(a), len(b)
+    prev = list(range(n + 1))
+    for i in range(1, m + 1):
+        cur = [i] + [0] * n
+        for j in range(1, n + 1):
+            cur[j] = prev[j - 1] if a[i - 1] == b[j - 1] else 1 + min(prev[j], cur[j - 1], prev[j - 1])
+        prev = cur
+    return prev[n]
 
 
 def _rerank(word, suggestions):
@@ -374,11 +399,26 @@ def check_spelling(value, lang, custom_words=None):
     known typo/contraction lookup, or a verified two-real-word split) and
     should be trusted for auto-applying regardless of suggestion length or
     whether it contains a space - unlike a raw dictionary suggestion, whose
-    confidence still depends on how close it is to the original word (see
-    `_is_confident` below). Skips placeholders like [XXX] (see
-    `_mask_brackets`) and short/ALLCAPS tokens (likely abbreviations)."""
+    confidence still depends on how close it is to the original word (real
+    edit distance <= 2, no inserted space/hyphen - see `_levenshtein` and
+    the gate right before the compound-split attempts below). Skips
+    placeholders like [XXX] (see `_mask_brackets`) and short/ALLCAPS tokens
+    (likely abbreviations)."""
     if not is_available(lang):
         return None  # explicitly "not checked", different from "no errors"
+    # Lazy import (avoids a circular import at module load time - core.engine
+    # imports this module's functions the same way, lazily, inside its own
+    # functions). A camelCase "<word>ID" identifier (e.g. "formulaID",
+    # "materialID") is already fully owned by the Terminology check
+    # (_split_id_identifiers in core/engine.py) - skip it here too, same
+    # discipline as glossary abbreviation keys below. Without this, a raw
+    # dictionary suggestion for the whole glued word (e.g. "formulaID" ->
+    # "formula", edit-distance 2) could get reported as a misleading
+    # "Words To Correct" entry that silently drops the "ID" suffix, even
+    # though the actual "Suggested Change" text is unaffected (structural
+    # fixes always run before spelling). Keep in sync with the same skip in
+    # spellCheckValue in docs/index.html.
+    from core.engine import _ID_IDENTIFIER_RE
     custom_words = custom_words or set()
     lib = _load_lib()
     h = _get_handle(lang)
@@ -390,6 +430,8 @@ def check_spelling(value, lang, custom_words=None):
         word = m.group(0).strip("'")
         if len(word) < 3 or word.isupper():
             continue  # skip short tokens/abbreviations like "IP", "OK"
+        if _ID_IDENTIFIER_RE.fullmatch(word):
+            continue  # camelCase "<word>ID" identifier - Terminology already owns this
         if _matches_custom_word(word.lower(), custom_words):
             continue  # known domain term (or its inflected form) - not a misspelling
         if word.lower() in ACCEPTED_SPELLING_VARIANTS:
@@ -420,6 +462,34 @@ def check_spelling(value, lang, custom_words=None):
             if stray_cap_fix:
                 results.append((word, [stray_cap_fix], True))
                 continue
+
+            # Compute the dictionary's own raw suggestions ONCE, before
+            # trying any compound-word split - a split is only ever the
+            # right fix when the word doesn't already have a close, ordinary
+            # single-word correction. Checking this FIRST prevents a
+            # coincidental valid two-word split from outranking a much more
+            # likely single-word typo fix. Verified directly (MRG's real
+            # report, 2026-09-01): "relevent" (a typo for "relevant", one
+            # letter off) has exactly one valid compound split - "rel" +
+            # "event", both real dictionary words - which used to win
+            # outright and produce the nonsensical "rel event" instead of
+            # the obviously-intended "relevant", because the splits were
+            # tried before any raw suggestion was ever consulted. Gated on
+            # real edit distance (not just length-diff, see
+            # `_levenshtein`) so this doesn't regress the "PalletInfo" /
+            # "taginfo" compound-split cases below, whose original words
+            # aren't actually close to any single real word. Keep in sync
+            # with spellCheckValue in docs/index.html.
+            slst = ctypes.POINTER(ctypes.c_char_p)()
+            n = lib.Hunspell_suggest(h, ctypes.byref(slst), word.encode("utf-8"))
+            raw_suggestions = _rerank(word, [slst[i].decode("utf-8") for i in range(n)])[:3]
+            lib.Hunspell_free_list(h, ctypes.byref(slst), n)
+
+            if (raw_suggestions and " " not in raw_suggestions[0] and "-" not in raw_suggestions[0]
+                    and _levenshtein(word.lower(), raw_suggestions[0].lower()) <= 2):
+                results.append((word, raw_suggestions, True))
+                continue
+
             camel_split = _try_camelcase_split(word, lib, h)
             if camel_split:
                 results.append((word, [camel_split], True))
@@ -428,12 +498,8 @@ def check_spelling(value, lang, custom_words=None):
             if lower_split:
                 results.append((word, [lower_split], True))
                 continue
-            slst = ctypes.POINTER(ctypes.c_char_p)()
-            n = lib.Hunspell_suggest(h, ctypes.byref(slst), word.encode("utf-8"))
-            suggestions = _rerank(word, [slst[i].decode("utf-8") for i in range(n)])[:3]
-            lib.Hunspell_free_list(h, ctypes.byref(slst), n)
-            confident = bool(suggestions) and _is_confident(word, suggestions[0])
-            results.append((word, suggestions, confident))
+
+            results.append((word, raw_suggestions, False))
     return results
 
 
@@ -449,33 +515,6 @@ def _match_case(original, suggestion):
     if original.islower():
         return suggestion.lower()
     return suggestion  # mixed/unusual casing - leave suggestion as-is
-
-
-def _is_confident(word, suggestion):
-    """Guard for a RAW dictionary suggestion only (i.e. hunspell's own
-    ranked guess, not a curated lookup or a verified two-word split - those
-    carry their own `confident=True` from check_spelling and skip this
-    entirely). Don't auto-apply a raw suggestion that's wildly different in
-    length from the original (e.g. 'dont' -> 'font' - both real words, same
-    length, but no actual relationship in meaning), or that inserts a
-    space/hyphen (raw multi-word suggestions are rarely right - Lesson 1).
-    Blunt, but prevents context-destroying silent substitutions.
-
-    BUG FIX (found 2026-08-25): this used to also be re-applied, via its
-    space/hyphen check, to suggestions that ALREADY came from
-    `_try_camelcase_split` / `_try_lowercase_compound_split` - which are
-    two-word results BY DESIGN (e.g. "PalletInfo" -> "Pallet Info"). Since
-    every multi-word suggestion always contains a space, this silently
-    blocked those verified splits from ever reaching "Suggested Change" -
-    they showed up correctly in the "Words To Correct" column but the
-    string itself was never actually fixed. Verified directly: before this
-    fix, `fix_spelling("PalletInfo needs review", ...)` returned the
-    string UNCHANGED despite detecting the correct split. Confidence is now
-    decided once, at the source, in check_spelling - this function is only
-    consulted for the raw-hunspell-suggestion case."""
-    if " " in suggestion or "-" in suggestion:
-        return False
-    return abs(len(word) - len(suggestion)) <= 2
 
 
 def fix_spelling(value, lang, custom_words=None):

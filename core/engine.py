@@ -17,6 +17,41 @@ DEFAULT_GLOSSARY = {
     "fg": "FG", "qc": "QC", "sscc": "SSCC", "drl": "DRL",
 }
 
+# Passive-voice constructions where a noun form is mistakenly typed in place
+# of the correct past-participle verb phrase - e.g. "has already been
+# handovers to AWETA" (the noun "handover(s)", not the verb phrase "handed
+# over"). "handover(s)" is a valid dictionary word on its own (see
+# core/spellcheck.py), so a generic spelling check never flags it - this is
+# a grammatical-slot problem, not a spelling one. Curated, exact-pattern
+# entries only - same discipline as REAL_WORD_TYPO_FIXES in
+# core/spellcheck.py (a real word that is nonetheless the wrong word for
+# this specific grammatical slot) - and scoped to the passive auxiliary
+# immediately before the noun so a legitimate plural-noun use elsewhere
+# (e.g. "View recent handovers") is never touched. Keys are regex patterns
+# (case-insensitive), values are their re.sub replacement (may use
+# backreferences). Keep in sync with PASSIVE_VOICE_FIXES in docs/index.html.
+PASSIVE_VOICE_FIXES = {
+    r"\b(been|being)\s+handovers?\b": r"\1 handed over",
+}
+
+# camelCase identifiers ending in "ID" (e.g. "formulaID", "materialID",
+# "barcodeID") are really two words glued together with no space. Only
+# fires when the character right before "ID" is lowercase - that's the
+# camelCase join boundary; an all-caps prefix (e.g. "SSCCID") is left alone
+# as ambiguous rather than guessed at. Keep in sync with ID_IDENTIFIER_RE in
+# docs/index.html.
+_ID_IDENTIFIER_RE = re.compile(r"\b([A-Za-z]*[a-z])ID\b")
+
+
+def _split_id_identifiers(v):
+    """Split a camelCase "<word>ID" identifier into "<word> ID" - run BEFORE
+    the glossary phrase-substitution step in fix_value() so a defined
+    canonical phrase (e.g. "barcode id" -> "Barcode ID") still applies
+    correctly once the space exists; an identifier with no defined phrase
+    (e.g. "formula ID") simply keeps its original leading-word casing, just
+    space-separated."""
+    return _ID_IDENTIFIER_RE.sub(lambda m: f"{m.group(1)} ID", v)
+
 # File-extension-like tokens that must never be treated as "end of sentence".
 _EXT_GUARD = r"(?!\w*\.(gif|png|jpe?g|pdf|csv|xlsx?))"
 
@@ -68,6 +103,34 @@ _MINOR_WORDS_CASING = {"of", "the", "a", "an", "in", "to", "and", "or", "is",
                         "are", "was", "were", "by", "on", "at", "as", "per",
                         "vs", "nor", "but", "for"}
 
+# A run of 2+ words joined by slashes and/or hyphens with no space (e.g.
+# "Hold/Resume", "On/Off", "Flash-Off") - a single meaningful compound
+# UI action/label or domain term, not independent prose words. See
+# _protected_phrase_spans below. Keep in sync with COMPOUND_WORD_RE in
+# docs/index.html.
+_COMPOUND_WORD_RE = re.compile(r"\b[A-Za-z]+(?:[/-][A-Za-z]+)+\b")
+
+# A word immediately named as the target of a UI interaction (e.g. "click
+# Confirm", "select the Retry option") is a reference to a literal
+# button/control label, not ordinary prose - its capitalization is
+# whatever that control is actually labeled, not a style choice this tool
+# can second-guess. Found via testing beyond the originally reported
+# "Hold/Resume" case: an UNQUOTED single-word reference like "click Confirm
+# to proceed" was still getting its capital silently stripped by the mixed
+# Title-case/sentence-case fix (treated as a lone Title-Case outlier in an
+# otherwise-lowercase sentence) - a QUOTED reference ("click 'Confirm' to
+# proceed") already happened to survive only by accident, because the
+# leading quote character breaks the cap/lowercase regex checks, not by
+# design. This closes that gap for the unquoted form too, and is the same
+# underlying "meaningful UI/action combination" problem as
+# _COMPOUND_WORD_RE above. Curated list of interaction verbs only - same
+# discipline as _CONTINUATION_WORDS below. Keep in sync with
+# ACTION_REFERENCE_RE in docs/index.html.
+_ACTION_REFERENCE_RE = re.compile(
+    r"\b(?:click|tap|press|select|choose|hit)\s+(?:on\s+|the\s+)?([A-Za-z][A-Za-z/-]*)\b",
+    re.IGNORECASE,
+)
+
 
 def _protected_phrase_spans(v, glossary):
     """Character spans in `v` covered by a multi-word defined-terminology
@@ -85,15 +148,33 @@ def _protected_phrase_spans(v, glossary):
     mechanism and runs AFTER the sentence-casing fix, so it restores the
     exact canonical casing regardless of what (if anything) happened to the
     phrase's words in this earlier step. Keep in sync with the same-purpose
-    helper in docs/index.html."""
+    helper in docs/index.html.
+
+    ALSO protects meaningful compound words joined by a slash (e.g.
+    "Hold/Resume", "On/Off") - these represent a single UI action/label, not
+    two independent prose words, regardless of whether either half is a
+    defined glossary term. Neither half may count as evidence of
+    "inconsistent" casing, nor be individually recast by the mixed
+    Title-case/sentence-case fix - found via MRG's report that "Hold/Resume"
+    was being silently split apart (one half lowercased) by that fix."""
     phrases = sorted((k for k in (glossary or {}) if " " in k), key=len, reverse=True)
-    if not phrases:
-        return []
-    pattern = r"\b(?:" + "|".join(re.escape(p) for p in phrases) + r")\b"
     spans = []
-    for m in re.finditer(pattern, v, flags=re.IGNORECASE):
-        if not any(s < m.end() and m.start() < e for s, e in spans):
-            spans.append((m.start(), m.end()))
+
+    def _add_span(start, end):
+        if not any(s < end and start < e for s, e in spans):
+            spans.append((start, end))
+
+    if phrases:
+        pattern = r"\b(?:" + "|".join(re.escape(p) for p in phrases) + r")\b"
+        for m in re.finditer(pattern, v, flags=re.IGNORECASE):
+            _add_span(m.start(), m.end())
+
+    for m in _COMPOUND_WORD_RE.finditer(v):
+        _add_span(m.start(), m.end())
+
+    for m in _ACTION_REFERENCE_RE.finditer(v):
+        _add_span(m.start(1), m.end(1))
+
     return spans
 
 
@@ -222,6 +303,25 @@ def fix_value(value, glossary, use_language_tool=False, lang="en"):
     if normalized_phrase != v:
         cats.append("Terminology (No. of -> number of)")
         v = normalized_phrase
+
+    # Passive-voice noun-for-verb mixups (e.g. "been handovers" -> "been
+    # handed over") - see PASSIVE_VOICE_FIXES above for why this can't be
+    # caught by spelling (the noun form is a real dictionary word).
+    for pattern, repl in PASSIVE_VOICE_FIXES.items():
+        fixed_phrase = re.sub(pattern, repl, v, flags=re.IGNORECASE)
+        if fixed_phrase != v:
+            cats.append("Grammar (passive voice phrasing)")
+            v = fixed_phrase
+
+    # camelCase identifiers ending in "ID" (e.g. "formulaID", "materialID",
+    # "barcodeID") - split BEFORE the glossary phrase-substitution block
+    # below runs, so a defined canonical phrase (e.g. "barcode id" ->
+    # "Barcode ID") still applies once the space exists. See
+    # _split_id_identifiers above.
+    id_split = _split_id_identifiers(v)
+    if id_split != v:
+        cats.append("Terminology (identifier + ID spacing)")
+        v = id_split
 
     # Capitalized word right after a mid-sentence comma ("..., Please...")
     # should be lowercase - real, repeated pattern found in this team's file.

@@ -27,6 +27,7 @@ groupset
 Vegam
 HCode
 iPAS
+vEdge
 
 # Common software/UI "toggle" verbs (un-/de-/pre-/mis- prefixed) that a
 # general English dictionary often only has the inflected form for, not the

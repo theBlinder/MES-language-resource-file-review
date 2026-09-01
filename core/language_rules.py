@@ -58,7 +58,7 @@ def check_entry(value, lang="en", glossary=None):
     # below - Terminology needs it to find glossary mismatches, Grammar
     # needs it to know which capitalized words are protected abbreviations
     # (e.g. "IDH", "DRL") rather than genuine casing inconsistencies.
-    from core.engine import DEFAULT_GLOSSARY
+    from core.engine import DEFAULT_GLOSSARY, PASSIVE_VOICE_FIXES, _ID_IDENTIFIER_RE
     active_glossary = glossary if glossary is not None else DEFAULT_GLOSSARY
 
     # ---------------- Spacing (language-aware) ----------------
@@ -205,6 +205,16 @@ def check_entry(value, lang="en", glossary=None):
         if w1 and len(w1) > 2 and w1 == w2:
             issues["Grammar"].append(f'Repeated word: "{words[i]} {words[i+1]}"')
 
+    # Passive-voice noun-for-verb mixups (e.g. "been handovers" - a real
+    # dictionary word used in the wrong grammatical slot, so spelling never
+    # catches it). See PASSIVE_VOICE_FIXES in core/engine.py.
+    if lang in ("en", "unknown"):
+        for pattern, repl in PASSIVE_VOICE_FIXES.items():
+            m = re.search(pattern, v, flags=re.IGNORECASE)
+            if m:
+                corrected = re.sub(pattern, repl, m.group(0), flags=re.IGNORECASE)
+                issues["Grammar"].append(f'"{m.group(0)}" should be "{corrected}"')
+
     # ---------------- Terminology (glossary, language-specific lists) ----
     # `active_glossary` was resolved once at the top of this function (BUG
     # FIX, found 2026-08-25: this used to re-import and use the hardcoded
@@ -226,6 +236,16 @@ def check_entry(value, lang="en", glossary=None):
             issues["Terminology"].append(
                 '"No. of" should be "number of" for consistency (the majority phrasing in this file)'
             )
+
+        # camelCase identifiers ending in "ID" (e.g. "formulaID",
+        # "materialID", "barcodeID") are two words glued together with no
+        # space - see _split_id_identifiers in core/engine.py, which this
+        # must stay in sync with so detection and fixing never disagree.
+        for m in re.finditer(_ID_IDENTIFIER_RE, v):
+            split_form = f"{m.group(1)} ID"
+            canonical = active_glossary.get(split_form.lower(), split_form)
+            if canonical not in v:
+                issues["Terminology"].append(f'"{m.group(0)}" should be "{canonical}"')
 
     # ---------------- Spelling (real dictionary check via Hunspell) --------
     # Glossary keys (e.g. "ccp", "idh") are known abbreviations, not

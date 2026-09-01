@@ -95,7 +95,16 @@ def build_report(path, out_path, lang_override=None, lt_client=None):
         # "Suggested Change" = the fully corrected string (ALL safe fixes
         # applied together, regardless of which single category the row
         # is filed under) - always review before applying, never auto-applied.
-        suggested, _cats = fix_value(value, glossary, use_language_tool=False, lang=lang_code)
+        suggested, cats = fix_value(value, glossary, use_language_tool=False, lang=lang_code)
+        # "Changes Applied" = exactly which fix(es) fired to produce
+        # `suggested`, e.g. "Spacing (double space); Grammar (capitalize
+        # sentence start)" - same category labels `cats` already carries
+        # internally (see fix_value in core/engine.py), just not previously
+        # surfaced in the Excel report. Empty when nothing was actually
+        # changed - lets a reviewer tell "verified clean, nothing to do"
+        # apart from "here is exactly what changed" at a glance, instead of
+        # having to diff Current Value against Suggested Change by eye.
+        changes_applied = "; ".join(cats)
         if suggested == value:
             suggested = "(needs manual review - no confident auto-suggestion)"
 
@@ -111,9 +120,9 @@ def build_report(path, out_path, lang_override=None, lt_client=None):
                 if s else f'"{w}" - no confident suggestion'
                 for w, s, _c in hits
             )
-            rows_by_category["Spelling"].append([lineno, key, value, suggested, words_col])
+            rows_by_category["Spelling"].append([lineno, key, value, suggested, words_col, changes_applied])
         elif chosen_category is not None:
-            rows_by_category[chosen_category].append([lineno, key, value, suggested])
+            rows_by_category[chosen_category].append([lineno, key, value, suggested, changes_applied])
 
         if key in seen_keys:
             duplicate_rows.append([lineno, key, value, f"Also defined at line {seen_keys[key]}"])
@@ -126,14 +135,14 @@ def build_report(path, out_path, lang_override=None, lt_client=None):
     wb = Workbook()
     wb.remove(wb.active)
 
-    headers4 = ["Line", "Resource Key", "Current Value", "Suggested Change"]
-    headers5 = headers4 + ["Words To Correct"]
+    headers4 = ["Line", "Resource Key", "Current Value", "Suggested Change", "Changes Applied"]
+    headers5 = ["Line", "Resource Key", "Current Value", "Suggested Change", "Words To Correct", "Changes Applied"]
 
     ws = wb.create_sheet("Spelling")
     _write_sheet(ws, headers5, rows_by_category["Spelling"])
     from core.spellcheck import is_available as spell_available
     if not spell_available(lang_code):
-        ws.cell(row=1, column=7, value=f"Note: no spelling dictionary installed for '{lang_code}' - spelling not checked, sheet reflects that, not 'no errors'")
+        ws.cell(row=1, column=8, value=f"Note: no spelling dictionary installed for '{lang_code}' - spelling not checked, sheet reflects that, not 'no errors'")
 
     ws = wb.create_sheet("Grammar")
     _write_sheet(ws, headers4, rows_by_category["Grammar"])

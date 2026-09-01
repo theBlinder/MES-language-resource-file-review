@@ -13,5 +13,11 @@
   "application line": "Application Line",
   "handover bin": "Handover Bin",
   "order number": "Order Number",
-  "barcode id": "Barcode ID"
+  "barcode id": "Barcode ID",
+  "sample order number": "Sample Order Number",
+  "partial weigh": "Partial Weigh",
+  "baking": "Baking",
+  "flash-off": "Flash-Off",
+  "fash-off": "Flash-Off",
+  "hold/resume": "Hold/Resume"
 }

@@ -1,0 +1,11 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "qa-tool-docs",
+      "runtimeExecutable": "npx",
+      "runtimeArgs": ["-y", "http-server", "docs", "-p", "8123", "-c-1"],
+      "port": 8123
+    }
+  ]
+}
