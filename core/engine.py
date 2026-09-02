@@ -53,7 +53,14 @@ def _split_id_identifiers(v):
     return _ID_IDENTIFIER_RE.sub(lambda m: f"{m.group(1)} ID", v)
 
 # File-extension-like tokens that must never be treated as "end of sentence".
-_EXT_GUARD = r"(?!\w*\.(gif|png|jpe?g|pdf|csv|xlsx?))"
+# Checked right after the punctuation match, so this rejects when the word
+# immediately following IS one of these extensions (e.g. the "." in
+# "logo.png") - not when some LATER text happens to contain another dot.
+# BUG FIX: the old `\w*\.(gif|png|...)` form required a SECOND period
+# somewhere after the match to ever reject anything - "logo.png" has no
+# second period after the one just matched, so the guard never fired and
+# "logo.png file uploaded" was turned into "Logo. Png file uploaded".
+_EXT_GUARD = r"(?!(?:gif|png|jpe?g|pdf|csv|xlsx?)\b)"
 
 # Optional: real spelling/grammar via LanguageTool, only used if the package
 # + a local LanguageTool server are available on the machine running this.
@@ -400,7 +407,12 @@ def fix_value(value, glossary, use_language_tool=False, lang="en"):
         cats.append("Punctuation (repeated !/?)")
         v = depunct
 
-    deperiod = re.sub(r"\.\.(?!\.)", ".", v)
+    # `(?<!\.)` gate added, matching an ISOLATED pair of periods only.
+    # BUG FIX: without it, "\.\.(?!\.)" still matched the LAST two dots of
+    # any run of 3+ consecutive periods (nothing follows them to trip the
+    # "not followed by a third" check), so a genuine ellipsis like "Please
+    # wait..." was mangled into "Please wait.." instead of being left alone.
+    deperiod = re.sub(r"(?<!\.)\.\.(?!\.)", ".", v)
     if deperiod != v:
         cats.append("Punctuation (double period)")
         v = deperiod

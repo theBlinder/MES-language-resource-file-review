@@ -76,7 +76,10 @@ def check_entry(value, lang="en", glossary=None):
     # real report, 2026-09-02): "...for the plant .please contact
     # administrator." was never flagged at all. Keep in sync with the same
     # regex in docs/index.html.
-    if re.search(r"([.,!?;:])(?=[A-Za-z])(?!\w*\.(gif|png|jpe?g|pdf|csv|xlsx?))", v):
+    # File-extension guard checked right after the punctuation match (e.g.
+    # the "." in "logo.png") - see _EXT_GUARD in core/engine.py for why the
+    # old `\w*\.(gif|png|...)` form never actually rejected anything.
+    if re.search(r"([.,!?;:])(?=[A-Za-z])(?!(?:gif|png|jpe?g|pdf|csv|xlsx?)\b)", v):
         issues["Spacing"].append("Missing space after punctuation (run-on sentence)")
     # A space before a comma or period is never correct in ANY supported
     # language - only !?;: differs by language (French requires a space
@@ -97,7 +100,10 @@ def check_entry(value, lang="en", glossary=None):
     # ---------------- Grammar (structural, language-agnostic-ish) --------
     if re.search(r"([!?])\1+", v):
         issues["Grammar"].append("Repeated punctuation (e.g. \"!!\")")
-    if re.search(r"\.\.(?!\.)", v):
+    # `(?<!\.)` gate: matches an ISOLATED pair of periods only, so a genuine
+    # 3+-dot ellipsis is never flagged - see the matching fix in
+    # core/engine.py for why the un-gated version wrongly caught it too.
+    if re.search(r"(?<!\.)\.\.(?!\.)", v):
         issues["Grammar"].append("Double period (not an ellipsis)")
     if lang in ("en", "unknown"):
         if re.search(r"No\.Of\b", v):

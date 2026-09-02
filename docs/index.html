@@ -960,8 +960,12 @@ function checkEntry(value, lang, mixedCaseWords, customWordsForCasing) {
   // punctuation mark are independent problems - verified directly (MRG's
   // real report, 2026-09-02): "...for the plant .please contact
   // administrator." was never flagged at all. Keep in sync with the same
-  // regex in core/language_rules.py.
-  if (/([.,!?;:])(?=[A-Za-z])(?!\w*\.(gif|png|jpe?g|pdf|csv|xlsx?))/.test(v)) {
+  // regex in core/language_rules.py. File-extension guard checked right
+  // after the punctuation match (e.g. the "." in "logo.png") - the old
+  // `\w*\.(gif|png|...)` form required a SECOND period somewhere after the
+  // match to ever reject anything, so "logo.png" (no second period) was
+  // never actually protected.
+  if (/([.,!?;:])(?=[A-Za-z])(?!(?:gif|png|jpe?g|pdf|csv|xlsx?)\b)/.test(v)) {
     issues.Spacing.push("Missing space after punctuation (run-on sentence)");
   }
   // A space before a comma or period is never correct in ANY supported
@@ -980,7 +984,10 @@ function checkEntry(value, lang, mixedCaseWords, customWordsForCasing) {
 
   // ---------------- Grammar (structural) ----------------
   if (/([!?])\1+/.test(v)) issues.Grammar.push('Repeated punctuation (e.g. "!!")');
-  if (/\.\.(?!\.)/.test(v)) issues.Grammar.push("Double period (not an ellipsis)");
+  // `(?<!\.)` gate: matches an ISOLATED pair of periods only, so a genuine
+  // 3+-dot ellipsis is never flagged - see the matching fix in
+  // structuralFix below for why the un-gated version wrongly caught it too.
+  if (/(?<!\.)\.\.(?!\.)/.test(v)) issues.Grammar.push("Double period (not an ellipsis)");
   if (lang === "en" || lang === "unknown") {
     if (/No\.Of\b/.test(v)) {
       issues.Grammar.push('"No.Of" should be "No. of" (missing space, and "of" should be lowercase)');
@@ -1190,7 +1197,11 @@ function structuralFix(value, lang, mixedCaseWords, customWordsForCasing) {
   // "plant .please" has a stray space BEFORE the period and none after -
   // gating on "not preceded by whitespace" made this fix blind to that
   // shape entirely. Keep in sync with the same regex in core/engine.py.
-  const spaced = v.replace(/([.,!?;:])(?=[A-Za-z])(?!\w*\.(gif|png|jpe?g|pdf|csv|xlsx?))/g, "$1 ");
+  // File-extension guard checked right after the punctuation match (e.g.
+  // the "." in "logo.png") - the old `\w*\.(gif|png|...)` form required a
+  // SECOND period somewhere after the match to ever reject anything, so
+  // "logo.png" (no second period) was never actually protected.
+  const spaced = v.replace(/([.,!?;:])(?=[A-Za-z])(?!(?:gif|png|jpe?g|pdf|csv|xlsx?)\b)/g, "$1 ");
   if (spaced !== v) { cats.push("Spacing: added missing space after punctuation"); v = spaced; }
 
   // Capitalized word right after a mid-sentence comma ("..., Please...")
@@ -1238,7 +1249,12 @@ function structuralFix(value, lang, mixedCaseWords, customWordsForCasing) {
   const depunct = v.replace(/([!?])\1+/g, "$1");
   if (depunct !== v) { cats.push("Grammar: collapsed repeated punctuation"); v = depunct; }
 
-  const deperiod = v.replace(/\.\.(?!\.)/g, ".");
+  // `(?<!\.)` gate added, matching an ISOLATED pair of periods only.
+  // BUG FIX: without it, "\.\.(?!\.)" still matched the LAST two dots of
+  // any run of 3+ consecutive periods (nothing follows them to trip the
+  // "not followed by a third" check), so a genuine ellipsis like "Please
+  // wait..." was mangled into "Please wait.." instead of being left alone.
+  const deperiod = v.replace(/(?<!\.)\.\.(?!\.)/g, ".");
   if (deperiod !== v) { cats.push("Grammar: fixed double period"); v = deperiod; }
 
   // A comma directly before a capitalized yes/no-question auxiliary (Are,
