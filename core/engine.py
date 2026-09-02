@@ -192,28 +192,30 @@ def _fix_mixed_case_casing(v, glossary):
     words after the first one, ignoring exempt words) so this never touches
     a string that detection wouldn't also flag.
 
-    BUG FIX: this used to always assume sentence case was the "correct"
-    target and blindly lowercase every capitalized content word after the
-    first - so a string like "Please Hold/Resume the Process" with one
-    genuinely inconsistent word elsewhere could still wrongly lowercase an
-    unrelated, correctly-capitalized word like "Resume" just for being
-    Title Case somewhere in the same string. Now the MAJORITY casing among
-    the words actually eligible to change (i.e. excluding acronyms and
-    protected terms - see `_is_exempt` below) is treated as this string's
-    real style, and only the minority OUTLIER words get converted to match
-    it; a word that's already consistent with the majority is never
-    touched, regardless of its own case. A tie defaults to sentence case
-    (this function's long-standing default direction).
+    Sentence case is ALWAYS the target once a real mix is found - a stray
+    capitalized content word gets lowercased regardless of how many OTHER
+    stray capitals happen to be in the same string. BUG FIX (2026-09-02,
+    MRG's real reports): this used to pick the target by MAJORITY VOTE among
+    the handful of eligible words (capitalized count vs. lowercase count),
+    which sounds reasonable but isn't - with as few as 3-4 votable words,
+    just 2 stray capitals were enough to out-vote a single lowercase word
+    and drag an entire ordinary sentence-case message UP into full Title
+    Case (e.g. "Failed to load pallet Info" -> "Failed To Load Pallet
+    Info"), the exact opposite of this project's own stated rule that a
+    normal UI sentence uses sentence case (see check_entry's "Sentence is
+    written in Title Case" detection, which independently confirms an
+    ALL-Title-Case string is itself the problem, never the goal). Sentence
+    case as a fixed target - not a vote - means this now correctly handles
+    both a partial mix and a string written entirely in Title Case (no
+    lowercase word at all) the exact same way.
 
-    Also handles the separate case of a string written ENTIRELY in Title
-    Case (every eligible word capitalized, no mix at all) - majority vote
-    alone would call that "no problem" (100% agreement), but a normal UI
-    sentence/message written throughout in Title Case is itself the issue
-    MRG reported (e.g. "Oven Capacity Limit Exceeds the Maximum Number of
-    Baking Activities Allowed in Parallel for Selected Oven"). When there's
-    no lowercase word to vote against, sentence case is FORCED as the
-    target rather than derived from the vote - see the `low_count` check
-    below.
+    A word that's genuinely meant to stay capitalized despite this - an
+    ALL-CAPS acronym, a protected custom-dictionary/glossary term, or a
+    slash/hyphen-joined compound like "Hold/Resume" - is never touched at
+    all, in either direction: see `_is_exempt` below and
+    `_protected_phrase_spans`, which is what actually protects e.g.
+    "Resume" in "Please Hold/Resume the Process", independent of this
+    function's casing target.
 
     A defined multi-word terminology phrase (e.g. "Order Number", "Handover
     Bin" - see `_protected_phrase_spans`) is excluded from the vote entirely
@@ -253,7 +255,21 @@ def _fix_mixed_case_casing(v, glossary):
     if cap_count == 0:
         return v  # nothing capitalized among the words eligible to change - no fix needed
 
-    target_is_title = (cap_count > low_count) if low_count else False
+    # ALWAYS sentence case, never a majority-vote toward Title Case. BUG FIX
+    # (verified directly, MRG's real reports, 2026-09-02): voting let 2
+    # stray capitals out-vote 1 lowercase word among as few as 3-4 votable
+    # words, so ordinary sentence-case error messages ("Failed to load
+    # pallet Info") got dragged INTO full Title Case ("Failed To Load
+    # Pallet Info") whenever just over half their content words happened to
+    # already be capitalized - the exact opposite of this project's own
+    # stated rule that normal UI sentences use sentence case (see
+    # check_entry's "Sentence is written in Title Case" detection).
+    # Sentence case as a fixed target (not a vote) means a stray capital is
+    # always corrected DOWN, regardless of how many other stray capitals
+    # happen to be in the same string - this already was true whenever
+    # `low_count` was 0 (the old ternary's `else False`); now it's true
+    # unconditionally instead of only for that one case.
+    target_is_title = False
 
     seen_first_content_word = [False]
     phrase_spans_v = _protected_phrase_spans(v, glossary)
@@ -342,11 +358,16 @@ def fix_value(value, glossary, use_language_tool=False, lang="en"):
         cats.append("Spacing (double space)")
         v = collapsed
 
-    # add space after punctuation glued to the next word (run-on sentence),
-    # but skip periods that precede a space already (e.g. " .gif" lists) or
-    # form part of a file extension.
+    # add space after punctuation glued to the next word (run-on sentence).
+    # No `(?<!\s)` gate before the punctuation mark - see the matching note
+    # in check_entry() for why: a period/comma/etc. can be missing its
+    # AFTER-space independently of whatever is (or isn't) before it, e.g.
+    # "plant .please" has a stray space BEFORE the period and none after -
+    # gating on "not preceded by whitespace" made this fix blind to that
+    # shape entirely. Still skips periods that form part of a file
+    # extension (e.g. " .gif" lists) via _EXT_GUARD.
     spaced = re.sub(
-        r"(?<!\s)([.,!?;:])(?=[A-Za-z])" + _EXT_GUARD, r"\1 ", v
+        r"([.,!?;:])(?=[A-Za-z])" + _EXT_GUARD, r"\1 ", v
     )
     if spaced != v:
         cats.append("Spacing (missing space after punctuation)")
@@ -357,7 +378,19 @@ def fix_value(value, glossary, use_language_tool=False, lang="en"):
         cats.append("Grammar (comma-continuation casing)")
         v = decapped
 
-    nospacebefore = re.sub(r"\s+([,!?;:])", r"\1", v)
+    # A space before a comma or period is never correct in ANY supported
+    # language - only !?;: differs by language (French requires a space
+    # before them, English/others don't) - so comma/period are handled
+    # unconditionally here, before the language-specific branch below
+    # decides what to do with !?;:. Previously comma/period weren't
+    # stripped at all here (only ,!?;: minus the period), so "plant ."
+    # never lost its stray leading space.
+    nospacebefore_comma_period = re.sub(r"\s+([,.])", r"\1", v)
+    if nospacebefore_comma_period != v:
+        cats.append("Spacing (space before punctuation)")
+        v = nospacebefore_comma_period
+
+    nospacebefore = re.sub(r"\s+([!?;:])", r"\1", v)
     if nospacebefore != v:
         cats.append("Spacing (space before punctuation)")
         v = nospacebefore
@@ -371,6 +404,35 @@ def fix_value(value, glossary, use_language_tool=False, lang="en"):
     if deperiod != v:
         cats.append("Punctuation (double period)")
         v = deperiod
+
+    # A comma directly before a capitalized yes/no-question auxiliary (Are,
+    # Is, Do, Does, Did, Will, Can, ...) that runs to the end of the string
+    # as its own "?" is a comma splice, not a real continuation - see the
+    # matching detection in check_entry() for the full rationale. Keep in
+    # sync with the same pattern in docs/index.html.
+    comma_splice_question = re.sub(
+        r",(\s+)((?:Am|Is|Are|Was|Were|Do|Does|Did|Have|Has|Had|Will|Would|Shall|Should|Can|Could|May|Might|Must)\b[^.!?]*\?)",
+        r".\1\2",
+        v,
+        count=1,
+    )
+    if comma_splice_question != v:
+        cats.append("Grammar (split comma splice before embedded question)")
+        v = comma_splice_question
+
+    # "Fail to X" at a sentence start is the wrong tense for this product's
+    # established "Failed to X" error-message convention - see the matching
+    # detection in check_entry() for the full rationale (anchored to
+    # sentence start specifically so "will/may/should fail to X", where
+    # present tense is correct, is never touched). Only touches the word
+    # itself, preserving whatever case the leading letter already had -
+    # sentence-start capitalization (if it's still wrong after this) is the
+    # capitalize-sentence-start fix's job below, not this one's. Keep in
+    # sync with the same pattern in docs/index.html.
+    verb_form_fixed = re.sub(r"(^|[.!?]\s+)([Ff])ail(\s+to\b)", r"\1\2ailed\3", v)
+    if verb_form_fixed != v:
+        cats.append('Grammar ("Fail to" -> "Failed to")')
+        v = verb_form_fixed
 
     # Don't blindly uppercase a letter if the word starting right there is a
     # custom-dictionary term with deliberate internal casing (e.g. "iPAS",
@@ -449,11 +511,21 @@ def fix_value(value, glossary, use_language_tool=False, lang="en"):
     # Glossary keys (e.g. "ccp") are known abbreviations, already handled by
     # the Terminology step above - skip them here too so spelling never
     # overwrites one with an unrelated dictionary guess (e.g. "ccp" -> "cp").
-    spelling_skip_words = get_custom_words() | ({k.lower() for k in glossary} if glossary else set())
-    spelled = fix_spelling(v, lang, spelling_skip_words)
-    if spelled != v:
-        cats.append("Spelling (dictionary correction)")
-        v = spelled
+    #
+    # Isolated in its own try/except: every fix above this point (spacing,
+    # grammar, terminology) has already been safely applied to `v` - an
+    # unexpected failure in spelling (e.g. a malformed word tripping up
+    # hunspell) must not discard that work and return the string unfixed.
+    # Mirrors the same isolation already used for spellCheckValue in
+    # docs/index.html.
+    try:
+        spelling_skip_words = get_custom_words() | ({k.lower() for k in glossary} if glossary else set())
+        spelled = fix_spelling(v, lang, spelling_skip_words)
+        if spelled != v:
+            cats.append("Spelling (dictionary correction)")
+            v = spelled
+    except Exception:
+        pass
 
     return v, cats
 

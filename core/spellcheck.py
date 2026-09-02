@@ -101,6 +101,38 @@ def _try_camelcase_split(word, lib, h):
     return None
 
 
+def _try_adjacent_transposition(word, lib, h):
+    """Swapping two adjacent letters (e.g. 'laod' -> 'load', 'teh' -> 'the')
+    is one of the most common human typing errors, and unlike an arbitrary
+    substitution it reuses every original letter - so when swapping ONE pair
+    of neighboring letters yields a real dictionary word, that's a far more
+    targeted, information-preserving explanation of the typo than a generic
+    nearest-neighbor dictionary suggestion. Hunspell's own suggestion ranking
+    is not frequency-aware, so it can easily surface an obscure real word
+    ahead of the actual transposition target - verified directly (MRG's real
+    reports, 2026-09-02): for 'laod', hunspell's raw suggestions rank 'lad'
+    (a real but rare noun, one deletion away) ahead of 'load' (the obviously
+    intended word, a transposition away); same root cause turned 'pelase'
+    (meant to be 'please') into 'pelage' (a rare zoology term for an
+    animal's fur). Checked BEFORE raw suggestions are ever consulted so it
+    isn't shadowed by that ranking. Requires EXACTLY ONE valid swap, same
+    ambiguity discipline as the compound-split helpers below - if two
+    different swaps each produce a real word, there's no reliable way to
+    pick, so this backs off and lets the normal suggestion path handle it.
+    Keep in sync with tryAdjacentTransposition in docs/index.html."""
+    chars = list(word)
+    found = set()
+    for i in range(len(chars) - 1):
+        if chars[i] == chars[i + 1]:
+            continue
+        swapped = chars[:]
+        swapped[i], swapped[i + 1] = swapped[i + 1], swapped[i]
+        candidate = "".join(swapped)
+        if lib.Hunspell_spell(h, candidate.encode("utf-8")):
+            found.add(candidate)
+    return next(iter(found)) if len(found) == 1 else None
+
+
 def _try_stray_capital_fix(word, lib, h):
     """A word with an unexpected capital letter somewhere after the first
     character (e.g. 'enTer') is almost always a single word typed with a
@@ -276,6 +308,44 @@ ACCEPTED_SPELLING_VARIANTS = {
     "cancelled",
 }
 
+# Generalizes ACCEPTED_SPELLING_VARIANTS above to an entire CLASS of
+# spelling instead of one curated word at a time: a handful of well-
+# established British/American (etc.) suffix alternations account for
+# almost every "valid word, just the other region's spelling" case a
+# generic en_US dictionary rejects - "-ogue"/"-og" (catalogue/catalog),
+# "-our"/"-or" (colour/color), "-ise"/"-ize" (organise/organize), and so on.
+# Verified directly (MRG's real report, 2026-09-02): "Catalogue" was being
+# "corrected" to "Cataloged"/"Catalog" purely because hunspell's own
+# suggestion ranking doesn't know it's a legitimate regional spelling, not a
+# typo - same root cause as the original "cancelled" bug this pattern
+# replaces the need for. Checked in _is_regional_spelling_variant below:
+# if undoing one of these patterns on the word yields a REAL dictionary
+# word, the original is already correctly spelled and must never be
+# flagged. Keep in sync with REGIONAL_SUFFIX_PAIRS in docs/index.html.
+REGIONAL_SUFFIX_PAIRS = [
+    ("ogue", "og"), ("ogues", "ogs"),
+    ("our", "or"), ("ours", "ors"),
+    ("ise", "ize"), ("ised", "ized"), ("ising", "izing"), ("iser", "izer"),
+    ("isers", "izers"), ("isation", "ization"), ("isations", "izations"),
+    ("yse", "yze"), ("ysed", "yzed"), ("ysing", "yzing"), ("yser", "yzer"),
+    ("tre", "ter"), ("tres", "ters"),
+    ("ence", "ense"),
+    ("lled", "led"), ("lling", "ling"), ("ller", "ler"),
+]
+
+
+def _is_regional_spelling_variant(word_lower, lib, h):
+    """True if `word_lower` turns into a real dictionary word by undoing one
+    of the REGIONAL_SUFFIX_PAIRS alternations above - i.e. it's standard
+    English under a different region's spelling convention, not a typo, and
+    should never be flagged or "corrected" toward the other region's form."""
+    for a, b in REGIONAL_SUFFIX_PAIRS:
+        if word_lower.endswith(a) and lib.Hunspell_spell(h, (word_lower[: -len(a)] + b).encode("utf-8")):
+            return True
+        if word_lower.endswith(b) and lib.Hunspell_spell(h, (word_lower[: -len(b)] + a).encode("utf-8")):
+            return True
+    return False
+
 
 def _levenshtein(a, b):
     """Real edit distance (insert/delete/substitute), not just a length-diff
@@ -331,6 +401,57 @@ def get_custom_words(path=None):
         default_path = path or os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "custom_dictionary.txt")
         _custom_words_cache = load_custom_words(default_path)
     return _custom_words_cache
+
+
+_domain_words_cache = None
+
+
+def get_domain_words_for_fuzzy_match(path=None):
+    """Same source as get_custom_words, filtered to 4+ letter entries and
+    cached as a list for repeated edit-distance scans (see
+    _try_domain_fuzzy_match). Short entries (e.g. 'sscc', 'idh') are
+    excluded: at edit-distance <= 2, almost any short typo of an unrelated
+    word can coincidentally land within range of a 3-4 letter acronym, so
+    fuzzy-matching them is more likely to misfire than help - they're still
+    caught by the exact/inflected match in _matches_custom_word. Keep in
+    sync with the same-purpose filter in docs/index.html."""
+    global _domain_words_cache
+    if _domain_words_cache is None:
+        _domain_words_cache = [w for w in get_custom_words(path) if len(w) >= 4]
+    return _domain_words_cache
+
+
+def _try_domain_fuzzy_match(word_lower, domain_words, raw_top_distance):
+    """custom_dictionary.txt words are real product vocabulary that a
+    generic English dictionary can never suggest (it doesn't know them at
+    all) - so a typo'd domain term (e.g. 'prewigh' for 'preweigh') only ever
+    gets scored against unrelated real English words (e.g. 'prewash'),
+    which can win hunspell's edit-distance gate purely because English
+    happens to have a coincidentally close word. Verified directly (MRG's
+    real report, 2026-09-02): 'Prewigh label not found' was being
+    "corrected" to 'Prewash label not found' for exactly this reason, even
+    though 'preweigh' (already in custom_dictionary.txt) is one insertion
+    away and 'prewash' is two substitutions away. Comparing the typo
+    against the product's own vocabulary too, and preferring a domain match
+    ONLY when it's a STRICTLY closer fit than hunspell's own top guess (or
+    hunspell has no guess at all), fixes this without special-casing any
+    individual word - it generalizes to every current and future entry in
+    custom_dictionary.txt. Requires the closest domain word to be uniquely
+    closest (same ambiguity discipline as the compound-split helpers) - a
+    tie between two domain words means there's no reliable pick. Keep in
+    sync with tryDomainFuzzyMatch in docs/index.html."""
+    best, best_dist, tie_count = None, None, 0
+    for cw in domain_words:
+        if abs(len(cw) - len(word_lower)) > 2:
+            continue
+        d = _levenshtein(word_lower, cw)
+        if best_dist is None or d < best_dist:
+            best, best_dist, tie_count = cw, d, 1
+        elif d == best_dist:
+            tie_count += 1
+    if best_dist is not None and best_dist <= 2 and tie_count == 1 and best_dist < raw_top_distance:
+        return best
+    return None
 
 
 _mixed_case_words_cache = None
@@ -392,6 +513,15 @@ def _mask_brackets(value):
     return _BRACKET_RE.sub(lambda m: "#" * len(m.group(0)), value)
 
 
+_STRAY_QUOTE_WORD_RE = re.compile(r"[A-Za-z]+[\"‘’“”][A-Za-z]+")
+_STRAY_QUOTE_CHAR_RE = re.compile(r"[\"‘’“”]")
+
+
+def _fix_stray_quote_word(word):
+    """Swap a mistyped mid-word quote character for a real apostrophe."""
+    return _STRAY_QUOTE_CHAR_RE.sub("'", word)
+
+
 def check_spelling(value, lang, custom_words=None):
     """Returns list of (word, [suggestions], confident) for words not found
     in the dictionary OR the custom word list. `confident` is True when the
@@ -422,8 +552,43 @@ def check_spelling(value, lang, custom_words=None):
     custom_words = custom_words or set()
     lib = _load_lib()
     h = _get_handle(lang)
+    domain_words = get_domain_words_for_fuzzy_match()
     results = []
-    for m in _WORD_RE.finditer(_mask_brackets(value)):
+
+    # A straight double-quote or curly quote directly between two letters
+    # (no surrounding whitespace) is virtually never a real quotation mark -
+    # a genuine quoted word always has a space/punctuation/string boundary
+    # next to the quote (e.g. 'Confirm' button). It's almost always the
+    # apostrophe key mistyped (shift not held, since ' and " share a key on
+    # most keyboards) or a curly quote substituted by autocorrect. Verified
+    # directly (MRG's real report, 2026-09-02): 'doesn"t' used to be
+    # extracted as two separate garbage tokens ('doesn' and 't', since '"'
+    # isn't part of the word-character class), and 'doesn' alone then got
+    # "corrected" to 'does' - silently dropping the 'n' and never even
+    # reaching a real contraction fix, because the word never existed as a
+    # single token in the first place. Handled as its own pre-pass (checked
+    # unconditionally, like REAL_WORD_TYPO_FIXES) rather than by
+    # normalizing the whole value up front: hunspell already accepts
+    # "doesn't" as valid once the apostrophe is real, so a silent up-front
+    # normalization would make the word look already-correct and this typo
+    # would never be counted as an issue or shown as a fix at all. The
+    # matched span is masked out of the copy used below so its fragments
+    # aren't independently re-processed by the normal per-word loop. Keep
+    # in sync with the same-purpose pass in spellCheckValue in
+    # docs/index.html.
+    masked = _mask_brackets(value)
+    stray_quote_matches = [sq for sq in _STRAY_QUOTE_WORD_RE.finditer(masked) if not sq.group(0).isupper()]
+    for sq in stray_quote_matches:
+        word = sq.group(0)
+        results.append((word, [_fix_stray_quote_word(word)], True))
+    if stray_quote_matches:
+        chars = list(masked)
+        for sq in stray_quote_matches:
+            for i in range(sq.start(), sq.end()):
+                chars[i] = "#"
+        masked = "".join(chars)
+
+    for m in _WORD_RE.finditer(masked):
         # Strip leading/trailing quote-apostrophes used as quotation marks
         # (e.g. 'Confirm' meaning the button labeled Confirm) - but keep
         # internal apostrophes from real contractions (don't, user's).
@@ -451,6 +616,11 @@ def check_spelling(value, lang, custom_words=None):
                 # _is_valid_prefixed_compound) - correctly spelled as one
                 # word, not a misspelling at all.
                 continue
+            if _is_regional_spelling_variant(word.lower(), lib, h):
+                # Standard English under a different region's spelling
+                # convention (see REGIONAL_SUFFIX_PAIRS) - correctly spelled,
+                # not a misspelling at all.
+                continue
             known_fix = CONTRACTION_FIXES.get(word.lower()) or KNOWN_TYPO_FIXES.get(word.lower())
             if known_fix:
                 # Known contraction or hand-verified typo - use directly,
@@ -461,6 +631,10 @@ def check_spelling(value, lang, custom_words=None):
             stray_cap_fix = _try_stray_capital_fix(word, lib, h)
             if stray_cap_fix:
                 results.append((word, [stray_cap_fix], True))
+                continue
+            transposition_fix = _try_adjacent_transposition(word, lib, h)
+            if transposition_fix:
+                results.append((word, [transposition_fix], True))
                 continue
 
             # Compute the dictionary's own raw suggestions ONCE, before
@@ -484,9 +658,18 @@ def check_spelling(value, lang, custom_words=None):
             n = lib.Hunspell_suggest(h, ctypes.byref(slst), word.encode("utf-8"))
             raw_suggestions = _rerank(word, [slst[i].decode("utf-8") for i in range(n)])[:3]
             lib.Hunspell_free_list(h, ctypes.byref(slst), n)
+            raw_top_distance = _levenshtein(word.lower(), raw_suggestions[0].lower()) if raw_suggestions else float("inf")
+
+            # Try the product's own vocabulary before accepting hunspell's
+            # generic top guess - see _try_domain_fuzzy_match for why this
+            # must run before the raw-suggestion gate below, not after.
+            domain_fix = _try_domain_fuzzy_match(word.lower(), domain_words, raw_top_distance)
+            if domain_fix:
+                results.append((word, [domain_fix], True))
+                continue
 
             if (raw_suggestions and " " not in raw_suggestions[0] and "-" not in raw_suggestions[0]
-                    and _levenshtein(word.lower(), raw_suggestions[0].lower()) <= 2):
+                    and raw_top_distance <= 2):
                 results.append((word, raw_suggestions, True))
                 continue
 

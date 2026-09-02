@@ -66,10 +66,28 @@ def check_entry(value, lang="en", glossary=None):
         issues["Spacing"].append("Leading/trailing whitespace")
     if "  " in v:
         issues["Spacing"].append("Double space")
-    if re.search(r"(?<!\s)([.,!?;:])(?=[A-Za-z])(?!\w*\.(gif|png|jpe?g|pdf|csv|xlsx?))", v):
+    # No `(?<!\s)` gate before the punctuation mark: a sentence-ending mark
+    # glued to the next word is a "missing space after" issue regardless of
+    # whether it also happens to have a stray space BEFORE it (e.g. "plant
+    # .please" - space before the period, none after). Requiring "not
+    # preceded by whitespace" here used to make this rule blind to exactly
+    # that shape, since the "space before" and "space after" sides of a
+    # punctuation mark are independent problems - verified directly (MRG's
+    # real report, 2026-09-02): "...for the plant .please contact
+    # administrator." was never flagged at all. Keep in sync with the same
+    # regex in docs/index.html.
+    if re.search(r"([.,!?;:])(?=[A-Za-z])(?!\w*\.(gif|png|jpe?g|pdf|csv|xlsx?))", v):
         issues["Spacing"].append("Missing space after punctuation (run-on sentence)")
+    # A space before a comma or period is never correct in ANY supported
+    # language - only !?;: differs by language (French requires a space
+    # before them, English/others don't) - so comma/period are checked
+    # unconditionally here rather than only inside the English/other branch
+    # below. Previously excluded, which combined with the gap above left
+    # "plant .please" completely undetected on both sides of the period.
+    if re.search(r"\s+[,.]", v):
+        issues["Spacing"].append("Unexpected space before punctuation")
     if lang not in SPACE_BEFORE_PUNCT_LANGS:
-        if re.search(r"\s+[,!?;:]", v):
+        if re.search(r"\s+[!?;:]", v):
             issues["Spacing"].append("Unexpected space before punctuation")
     else:
         # French-family: a MISSING space before ! ? ; : is the actual issue
@@ -86,6 +104,43 @@ def check_entry(value, lang="en", glossary=None):
             issues["Grammar"].append('"No.Of" should be "No. of" (missing space, and "of" should be lowercase)')
         elif re.search(r"No\.\s*Of\b", v):
             issues["Grammar"].append('"Of" should be lowercase: "No. of", not "No. Of"')
+        # A comma directly before a capitalized yes/no-question auxiliary
+        # (Are, Is, Do, Does, Did, Will, Can, ...) that runs to the end of
+        # the string as its own "?" is a comma splice, not a real
+        # continuation - the auxiliary is legitimately capitalized because
+        # it starts an independent question, so the punctuation before it is
+        # wrong, not the casing. Verified directly (MRG's real report,
+        # 2026-09-02): "...waiting for DCS signals, Are you sure you want to
+        # consume material manually?" reads as one run-on clause ending in
+        # "signals, Are..." - grammatically that comma needs to be a period.
+        # GENERAL pattern (any standard English question-forming
+        # auxiliary/modal, not a fixed sentence) - scoped to "ends in its
+        # own bare '?'" so a genuine comma-separated list or an unrelated
+        # capitalized word after a comma is never touched; the existing
+        # comma-continuation lowercase-fix below already owns THAT case and
+        # deliberately does not include any of these auxiliaries, so the two
+        # checks can never disagree about the same word. Keep in sync with
+        # the same pattern in docs/index.html.
+        if re.search(
+            r",\s+(?:Am|Is|Are|Was|Were|Do|Does|Did|Have|Has|Had|Will|Would|Shall|Should|Can|Could|May|Might|Must)\b[^.!?]*\?",
+            v,
+        ):
+            issues["Grammar"].append(
+                'Comma splice before an embedded question - should be a new sentence ("." instead of ",")'
+            )
+        # "Fail to X" at a sentence start is the wrong tense for this
+        # product's error-message convention ("Failed to X", matching every
+        # other message in this file) - a bare present-tense "Fail" only
+        # belongs right after a modal/auxiliary ("will fail to", "may fail
+        # to"), never as the first word of the sentence, so anchoring to the
+        # sentence start (not a bare "fail" anywhere) is what keeps this
+        # from misfiring on those. Verified directly (MRG's real report,
+        # 2026-09-02): "Fail to add comment" passes spelling (both "Fail"
+        # and "Failed" are real words) so nothing previously caught this.
+        # See VERB_FORM_FIXES in core/engine.py for the matching fix. Keep
+        # in sync with the same pattern in docs/index.html.
+        if re.search(r"(?:^|[.!?]\s+)[Ff]ail\s+to\b", v):
+            issues["Grammar"].append('"Fail to" should be "Failed to" at the start of a sentence')
     # Don't flag a custom-dictionary term with deliberate internal casing
     # (e.g. "iPAS", "macOS") as "doesn't start with a capital" just because
     # it happens to start with a lowercase letter - that casing is correct

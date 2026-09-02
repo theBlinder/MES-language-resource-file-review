@@ -9,6 +9,8 @@
 # ACCEPTED_SPELLING_VARIANTS in core/spellcheck.py / docs/index.html
 # instead. MRG was explicit about this distinction, 2026-08-27.
 preweigh
+fillweight
+sprayout
 preprocess
 prebatch
 packoff
@@ -28,6 +30,7 @@ Vegam
 HCode
 iPAS
 vEdge
+UoM
 
 # Common software/UI "toggle" verbs (un-/de-/pre-/mis- prefixed) that a
 # general English dictionary often only has the inflected form for, not the

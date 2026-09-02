@@ -233,9 +233,12 @@ const SPACE_BEFORE_PUNCT_LANGS = new Set(["fr"]);
 const GLOSSARY = {
   ip: "IP", sop: "SOP", hu: "HU", po: "PO", fg: "FG", qc: "QC", sscc: "SSCC", drl: "DRL", idh: "IDH", ccp: "CCP",
   "application order": "Application Order", "application line": "Application Line",
-  "handover bin": "Handover Bin", "order number": "Order Number", "barcode id": "Barcode ID",
+  "handover bin": "Handover Bin", "order number": "Order Number", "process order number": "Process Order Number",
+  "barcode id": "Barcode ID",
   "sample order number": "Sample Order Number", "partial weigh": "Partial Weigh",
-  "baking": "Baking", "flash-off": "Flash-Off", "fash-off": "Flash-Off",
+  "baking": "Baking", "sprayout": "Sprayout",
+  "flash-off": "Flash-Off", "fash-off": "Flash-Off", "flash off": "Flash-Off",
+  "uom": "UoM",
   "hold/resume": "Hold/Resume",
 };
 // Hunspell dictionaries only meaningfully exist / apply for space-delimited languages.
@@ -425,6 +428,38 @@ const ACCEPTED_SPELLING_VARIANTS = new Set([
   "cancelled",
 ]);
 
+// Generalizes ACCEPTED_SPELLING_VARIANTS above to an entire CLASS of
+// spelling instead of one curated word at a time: a handful of well-
+// established British/American (etc.) suffix alternations account for
+// almost every "valid word, just the other region's spelling" case a
+// generic en_US dictionary rejects - "-ogue"/"-og" (catalogue/catalog),
+// "-our"/"-or" (colour/color), "-ise"/"-ize" (organise/organize), and so on.
+// Verified directly (MRG's real report, 2026-09-02): "Catalogue" was being
+// "corrected" to "Cataloged"/"Catalog" purely because typo-js's own
+// suggestion ranking doesn't know it's a legitimate regional spelling, not
+// a typo - same root cause as the original "cancelled" bug this pattern
+// replaces the need for. Checked in isRegionalSpellingVariant below: if
+// undoing one of these patterns on the word yields a REAL dictionary word,
+// the original is already correctly spelled and must never be flagged.
+// Keep in sync with REGIONAL_SUFFIX_PAIRS in core/spellcheck.py.
+const REGIONAL_SUFFIX_PAIRS = [
+  ["ogue", "og"], ["ogues", "ogs"],
+  ["our", "or"], ["ours", "ors"],
+  ["ise", "ize"], ["ised", "ized"], ["ising", "izing"], ["iser", "izer"],
+  ["isers", "izers"], ["isation", "ization"], ["isations", "izations"],
+  ["yse", "yze"], ["ysed", "yzed"], ["ysing", "yzing"], ["yser", "yzer"],
+  ["tre", "ter"], ["tres", "ters"],
+  ["ence", "ense"],
+  ["lled", "led"], ["lling", "ling"], ["ller", "ler"],
+];
+function isRegionalSpellingVariant(wordLower, dict) {
+  for (const [a, b] of REGIONAL_SUFFIX_PAIRS) {
+    if (wordLower.endsWith(a) && dict.check(wordLower.slice(0, -a.length) + b)) return true;
+    if (wordLower.endsWith(b) && dict.check(wordLower.slice(0, -b.length) + a)) return true;
+  }
+  return false;
+}
+
 // "Real word, but almost certainly the WRONG real word in this context" -
 // these pass typo-js's check cleanly (valid dictionary words), so the normal
 // misspelling gate never looks at them. Found via a real reported example
@@ -518,6 +553,37 @@ function tryStrayCapitalFix(word, dict) {
   return null;
 }
 
+// Swapping two adjacent letters (e.g. "laod" -> "load", "teh" -> "the") is
+// one of the most common human typing errors, and unlike an arbitrary
+// substitution it reuses every original letter - so when swapping ONE pair
+// of neighboring letters yields a real dictionary word, that's a far more
+// targeted, information-preserving explanation of the typo than a generic
+// nearest-neighbor dictionary suggestion. typo-js's own suggestion ranking
+// is not frequency-aware, so it can easily surface an obscure real word
+// ahead of the actual transposition target - verified directly (MRG's real
+// reports, 2026-09-02): for "laod", typo-js's raw suggestions rank "lad"
+// (a real but rare noun, one deletion away) ahead of "load" (the obviously
+// intended word, a transposition away); same root cause turned "pelase"
+// (meant to be "please") into "pelage" (a rare zoology term for an
+// animal's fur). Checked BEFORE raw suggestions are ever consulted so it
+// isn't shadowed by that ranking. Requires EXACTLY ONE valid swap, same
+// ambiguity discipline as the compound-split helpers below - if two
+// different swaps each produce a real word, there's no reliable way to
+// pick, so this backs off and lets the normal suggestion path handle it.
+// Keep in sync with _try_adjacent_transposition in core/spellcheck.py.
+function tryAdjacentTransposition(word, dict) {
+  const chars = word.split("");
+  const found = new Set();
+  for (let i = 0; i < chars.length - 1; i++) {
+    if (chars[i] === chars[i + 1]) continue;
+    const swapped = chars.slice();
+    [swapped[i], swapped[i + 1]] = [swapped[i + 1], swapped[i]];
+    const candidate = swapped.join("");
+    if (dict.check(candidate)) found.add(candidate);
+  }
+  return found.size === 1 ? [...found][0] : null;
+}
+
 // Only returns a split when exactly ONE split point is valid. A word like
 // "groupset" has two: "gro"+"upset" AND "group"+"set" - with no way to know
 // which one is intended, blindly picking the first one found (as this used
@@ -574,11 +640,95 @@ function maskBrackets(value) {
   return value.replace(/\[[^\]]*\]/g, m => "#".repeat(m.length));
 }
 
+// A straight double-quote or curly quote directly between two letters (no
+// surrounding whitespace) is virtually never a real quotation mark - a
+// genuine quoted word always has a space/punctuation/string boundary next
+// to the quote (e.g. "Confirm" button). It's almost always the apostrophe
+// key mistyped (shift not held, since ' and " share a key on most
+// keyboards) or a curly quote substituted by autocorrect. Verified directly
+// (MRG's real report, 2026-09-02): 'doesn"t' used to be extracted as two
+// separate garbage tokens ("doesn" and "t", since '"' isn't part of the
+// word-character class), and "doesn" alone then got "corrected" to "does" -
+// silently dropping the "n" and never even reaching a real contraction fix,
+// because the word never existed as a single token in the first place.
+// Handled as its own pre-pass in spellCheckValue below (checked
+// unconditionally, like REAL_WORD_TYPO_FIXES) rather than by normalizing
+// the whole value up front: typo-js already accepts "doesn't" as valid once
+// the apostrophe is real, so a silent up-front normalization would make the
+// word look already-correct and this typo would never be counted as an
+// issue or shown as a fix at all. Keep in sync with the same-purpose pass
+// in check_spelling in core/spellcheck.py.
+const STRAY_QUOTE_WORD_RE = /[A-Za-z]+["‘’“”][A-Za-z]+/g;
+const STRAY_QUOTE_CHAR_RE = /["‘’“”]/g;
+function fixStrayQuoteWord(word) {
+  return word.replace(STRAY_QUOTE_CHAR_RE, "'");
+}
+
+// custom_dictionary.txt words are real product vocabulary that a generic
+// English dictionary can never suggest (it doesn't know them at all) - so a
+// typo'd domain term (e.g. "prewigh" for "preweigh") only ever gets scored
+// against unrelated real English words (e.g. "prewash"), which can win
+// typo-js's edit-distance gate purely because English happens to have a
+// coincidentally close word. Verified directly (MRG's real report,
+// 2026-09-02): "Prewigh label not found" was being "corrected" to "Prewash
+// label not found" for exactly this reason, even though "preweigh" (already
+// in custom_dictionary.txt) is one insertion away and "prewash" is two
+// substitutions away. Comparing the typo against the product's own
+// vocabulary too, and preferring a domain match ONLY when it's a STRICTLY
+// closer fit than typo-js's own top guess (or typo-js has no guess at all),
+// fixes this without special-casing any individual word - it generalizes to
+// every current and future entry in custom_dictionary.txt. Restricted to
+// domain words of 4+ letters and requires the closest match to be uniquely
+// closest, same discipline as the compound-split helpers above - short
+// entries (e.g. "sscc", "idh") are common enough as edit-distance-2
+// neighbors of unrelated short typos that fuzzy-matching them is more
+// likely to misfire than help; they're still caught by the exact/inflected
+// match in matchesCustomWord. Keep in sync with _try_domain_fuzzy_match in
+// core/spellcheck.py.
+function tryDomainFuzzyMatch(wordLower, domainWords, rawTopDistance) {
+  let best = null, bestDist = Infinity, tieCount = 0;
+  for (const cw of domainWords) {
+    if (Math.abs(cw.length - wordLower.length) > 2) continue;
+    const d = levenshtein(wordLower, cw);
+    if (d < bestDist) { best = cw; bestDist = d; tieCount = 1; }
+    else if (d === bestDist) { tieCount++; }
+  }
+  if (bestDist <= 2 && tieCount === 1 && bestDist < rawTopDistance) return best;
+  return null;
+}
+
 function spellCheckValue(value, dict, customWords) {
   if (!dict) return { issues: [], corrected: value };
-  const words = extractWords(maskBrackets(value));
+  const domainWords = [...customWords].filter(w => w.length >= 4);
   const issues = [];
   let corrected = value;
+  const applyFix = (w, fix) => {
+    const re = new RegExp(`\\b${w.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\b`);
+    corrected = corrected.replace(re, fix);
+  };
+
+  // A mistyped mid-word quote character (e.g. 'doesn"t') is handled as its
+  // own pre-pass, unconditionally and BEFORE the normal word extraction
+  // below - see STRAY_QUOTE_WORD_RE above for why. The matched span is
+  // masked out of the copy handed to extractWords so its fragments aren't
+  // independently re-processed by the normal per-word loop.
+  let maskedForExtraction = maskBrackets(value);
+  const strayQuoteMatches = [...maskedForExtraction.matchAll(STRAY_QUOTE_WORD_RE)].filter(m => m[0] !== m[0].toUpperCase());
+  for (const m of strayQuoteMatches) {
+    const w = m[0];
+    const fixed = fixStrayQuoteWord(w);
+    issues.push({ word: w, best: fixed, confident: true, alternatives: [] });
+    applyFix(w, fixed);
+  }
+  if (strayQuoteMatches.length) {
+    const chars = maskedForExtraction.split("");
+    for (const m of strayQuoteMatches) {
+      for (let i = m.index; i < m.index + m[0].length; i++) chars[i] = "#";
+    }
+    maskedForExtraction = chars.join("");
+  }
+  const words = extractWords(maskedForExtraction);
+
   // Every word checked independently - a sentence with 2+ misspellings gets
   // BOTH corrected and BOTH listed, not just the first one found.
   for (const w of words) {
@@ -610,6 +760,12 @@ function spellCheckValue(value, dict, customWords) {
         // correctly spelled as one word, not a misspelling at all.
         continue;
       }
+      if (isRegionalSpellingVariant(w.toLowerCase(), dict)) {
+        // Standard English under a different region's spelling convention
+        // (see REGIONAL_SUFFIX_PAIRS) - correctly spelled, not a
+        // misspelling at all.
+        continue;
+      }
       const knownFix = CONTRACTION_FIXES[w.toLowerCase()] || KNOWN_TYPO_FIXES[w.toLowerCase()];
       if (knownFix) {
         // Known contraction or hand-verified typo - use directly, skip
@@ -624,6 +780,13 @@ function spellCheckValue(value, dict, customWords) {
         issues.push({ word: w, best: strayCapFix, confident: true, alternatives: [] });
         const re = new RegExp(`\\b${w.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\b`);
         corrected = corrected.replace(re, strayCapFix);
+        continue;
+      }
+      const transposed = tryAdjacentTransposition(w, dict);
+      if (transposed) {
+        issues.push({ word: w, best: transposed, confident: true, alternatives: [] });
+        const re = new RegExp(`\\b${w.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\b`);
+        corrected = corrected.replace(re, matchCase(w, transposed));
         continue;
       }
 
@@ -645,9 +808,21 @@ function spellCheckValue(value, dict, customWords) {
       // core/spellcheck.py.
       const raw = dict.suggest(w, 5);
       const ranked = rerankSuggestions(w, raw);
+      const rawTopDistance = ranked.length ? levenshtein(w.toLowerCase(), ranked[0].toLowerCase()) : Infinity;
+
+      // Try the product's own vocabulary before accepting typo-js's generic
+      // top guess - see tryDomainFuzzyMatch for why this must run before
+      // the raw-suggestion gate below, not after.
+      const domainFix = tryDomainFuzzyMatch(w.toLowerCase(), domainWords, rawTopDistance);
+      if (domainFix) {
+        issues.push({ word: w, best: domainFix, confident: true, alternatives: [] });
+        const re = new RegExp(`\\b${w.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\b`);
+        corrected = corrected.replace(re, matchCase(w, domainFix));
+        continue;
+      }
 
       if (ranked.length && !ranked[0].includes(" ") && !ranked[0].includes("-")
-          && levenshtein(w.toLowerCase(), ranked[0].toLowerCase()) <= 2) {
+          && rawTopDistance <= 2) {
         issues.push({ word: w, best: ranked[0], confident: true, alternatives: ranked.slice(1, 3) });
         const re = new RegExp(`\\b${w.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\b`);
         corrected = corrected.replace(re, matchCase(w, ranked[0]));
@@ -776,11 +951,28 @@ function checkEntry(value, lang, mixedCaseWords, customWordsForCasing) {
   // ---------------- Spacing (language-aware) ----------------
   if (v !== v.trim()) issues.Spacing.push("Leading/trailing whitespace");
   if (v.includes("  ")) issues.Spacing.push("Double space");
-  if (/(?<!\s)([.,!?;:])(?=[A-Za-z])(?!\w*\.(gif|png|jpe?g|pdf|csv|xlsx?))/.test(v)) {
+  // No `(?<!\s)` gate before the punctuation mark: a sentence-ending mark
+  // glued to the next word is a "missing space after" issue regardless of
+  // whether it also happens to have a stray space BEFORE it (e.g. "plant
+  // .please" - space before the period, none after). Requiring "not
+  // preceded by whitespace" here used to make this rule blind to exactly
+  // that shape, since the "space before" and "space after" sides of a
+  // punctuation mark are independent problems - verified directly (MRG's
+  // real report, 2026-09-02): "...for the plant .please contact
+  // administrator." was never flagged at all. Keep in sync with the same
+  // regex in core/language_rules.py.
+  if (/([.,!?;:])(?=[A-Za-z])(?!\w*\.(gif|png|jpe?g|pdf|csv|xlsx?))/.test(v)) {
     issues.Spacing.push("Missing space after punctuation (run-on sentence)");
   }
+  // A space before a comma or period is never correct in ANY supported
+  // language - only !?;: differs by language (French requires a space
+  // before them, English/others don't), so comma/period are checked
+  // unconditionally here rather than only inside the English/other branch
+  // below. Previously excluded, which combined with the gap above left
+  // "plant .please" completely undetected on both sides of the period.
+  if (/\s+[,.]/.test(v)) issues.Spacing.push("Unexpected space before punctuation");
   if (!SPACE_BEFORE_PUNCT_LANGS.has(lang)) {
-    if (/\s+[,!?;:]/.test(v)) issues.Spacing.push("Unexpected space before punctuation");
+    if (/\s+[!?;:]/.test(v)) issues.Spacing.push("Unexpected space before punctuation");
   } else {
     // French-family: a MISSING space before ! ? ; : is the actual issue.
     if (/[A-Za-z][!?;:]/.test(v)) issues.Spacing.push("Missing required space before punctuation (French-style spacing)");
@@ -794,6 +986,25 @@ function checkEntry(value, lang, mixedCaseWords, customWordsForCasing) {
       issues.Grammar.push('"No.Of" should be "No. of" (missing space, and "of" should be lowercase)');
     } else if (/No\.\s*Of\b/.test(v)) {
       issues.Grammar.push('"Of" should be lowercase: "No. of", not "No. Of"');
+    }
+    // Comma splice before an embedded yes/no question - see the matching
+    // fix in structuralFix below for the full rationale.
+    if (/,\s+(?:Am|Is|Are|Was|Were|Do|Does|Did|Have|Has|Had|Will|Would|Shall|Should|Can|Could|May|Might|Must)\b[^.!?]*\?/.test(v)) {
+      issues.Grammar.push('Comma splice before an embedded question - should be a new sentence ("." instead of ",")');
+    }
+    // "Fail to X" at a sentence start is the wrong tense for this product's
+    // error-message convention ("Failed to X", matching every other message
+    // in this file) - a bare present-tense "Fail" only belongs right after
+    // a modal/auxiliary ("will fail to", "may fail to"), never as the first
+    // word of the sentence, so anchoring to the sentence start (not a bare
+    // \b"fail"\b anywhere) is what keeps this from misfiring on those.
+    // Verified directly (MRG's real report, 2026-09-02): "Fail to add
+    // comment" passes spelling (both "Fail" and "Failed" are real words) so
+    // nothing previously caught this. See the matching fix in
+    // structuralFix below. Keep in sync with VERB_FORM_FIXES in
+    // core/engine.py.
+    if (/(?:^|[.!?]\s+)[Ff]ail\s+to\b/.test(v)) {
+      issues.Grammar.push('"Fail to" should be "Failed to" at the start of a sentence');
     }
   }
 
@@ -973,7 +1184,13 @@ function structuralFix(value, lang, mixedCaseWords, customWordsForCasing) {
   const collapsed = v.replace(/ {2,}/g, " ");
   if (collapsed !== v) { cats.push("Spacing: collapsed double space"); v = collapsed; }
 
-  const spaced = v.replace(/(?<!\s)([.,!?;:])(?=[A-Za-z])(?!\w*\.(gif|png|jpe?g|pdf|csv|xlsx?))/g, "$1 ");
+  // No `(?<!\s)` gate before the punctuation mark - see the matching note
+  // in checkEntry above for why: a period/comma/etc. can be missing its
+  // AFTER-space independently of whatever is (or isn't) before it, e.g.
+  // "plant .please" has a stray space BEFORE the period and none after -
+  // gating on "not preceded by whitespace" made this fix blind to that
+  // shape entirely. Keep in sync with the same regex in core/engine.py.
+  const spaced = v.replace(/([.,!?;:])(?=[A-Za-z])(?!\w*\.(gif|png|jpe?g|pdf|csv|xlsx?))/g, "$1 ");
   if (spaced !== v) { cats.push("Spacing: added missing space after punctuation"); v = spaced; }
 
   // Capitalized word right after a mid-sentence comma ("..., Please...")
@@ -1000,8 +1217,18 @@ function structuralFix(value, lang, mixedCaseWords, customWordsForCasing) {
     }
   }
 
+  // A space before a comma or period is never correct in ANY supported
+  // language - only !?;: differs by language (French requires a space
+  // before them, English/others don't) - so comma/period are handled
+  // unconditionally here, before the language-specific branch below decides
+  // what to do with !?;:. Previously comma/period weren't stripped at all
+  // here (only ,!?;: minus the period), so "plant ." never lost its stray
+  // leading space. Keep in sync with the same regex in core/engine.py.
+  const nospacebeforeCommaPeriod = v.replace(/\s+([,.])/g, "$1");
+  if (nospacebeforeCommaPeriod !== v) { cats.push("Spacing: removed unexpected space before punctuation"); v = nospacebeforeCommaPeriod; }
+
   if (!SPACE_BEFORE_PUNCT_LANGS.has(lang)) {
-    const nospacebefore = v.replace(/\s+([,!?;:])/g, "$1");
+    const nospacebefore = v.replace(/\s+([!?;:])/g, "$1");
     if (nospacebefore !== v) { cats.push("Spacing: removed unexpected space before punctuation"); v = nospacebefore; }
   } else {
     const spacedFr = v.replace(/([A-Za-z])([!?;:])/g, "$1 $2");
@@ -1013,6 +1240,40 @@ function structuralFix(value, lang, mixedCaseWords, customWordsForCasing) {
 
   const deperiod = v.replace(/\.\.(?!\.)/g, ".");
   if (deperiod !== v) { cats.push("Grammar: fixed double period"); v = deperiod; }
+
+  // A comma directly before a capitalized yes/no-question auxiliary (Are,
+  // Is, Do, Does, Did, Will, Can, ...) that runs to the end of the string as
+  // its own "?" is a comma splice, not a real continuation - the auxiliary
+  // is legitimately capitalized because it starts an independent question,
+  // so the punctuation before it is wrong, not the casing. Verified
+  // directly (MRG's real report, 2026-09-02): "...waiting for DCS signals,
+  // Are you sure you want to consume material manually?" reads as one
+  // run-on clause ending in "signals, Are..." - grammatically that comma
+  // needs to be a period. This is a GENERAL pattern (any of the standard
+  // English question-forming auxiliaries/modals, not a fixed sentence) -
+  // scoped to "ends in its own bare '?'" so a genuine comma-separated list
+  // or an unrelated capitalized word after a comma is never touched; the
+  // existing CONTINUATION_WORDS lowercase-fix above already owns THAT case
+  // and deliberately does not include any of these auxiliaries, so the two
+  // fixes can never fight over the same word. Keep in sync with the same
+  // pattern in core/engine.py.
+  const commaSpliceQuestion = v.replace(
+    /,(\s+)((?:Am|Is|Are|Was|Were|Do|Does|Did|Have|Has|Had|Will|Would|Shall|Should|Can|Could|May|Might|Must)\b[^.!?]*\?)/,
+    ".$1$2"
+  );
+  if (commaSpliceQuestion !== v) { cats.push("Grammar: split comma splice before embedded question"); v = commaSpliceQuestion; }
+
+  // "Fail to X" at a sentence start is the wrong tense for this product's
+  // established "Failed to X" error-message convention - see the matching
+  // detection in checkEntry above for the full rationale (anchored to
+  // sentence start specifically so "will/may/should fail to X", where
+  // present tense is correct, is never touched). Only touches the word
+  // itself, preserving whatever case the leading letter already had -
+  // sentence-start capitalization (if it's still wrong after this) is the
+  // capitalize-sentence-start fix's job below, not this one's. Keep in sync
+  // with VERB_FORM_FIXES in core/engine.py.
+  const verbFormFixed = v.replace(/(^|[.!?]\s+)([Ff])ail(\s+to\b)/g, "$1$2ailed$3");
+  if (verbFormFixed !== v) { cats.push('Grammar: "Fail to" -> "Failed to"'); v = verbFormFixed; }
 
   // Capitalize the start of EVERY sentence, not just the first one in the
   // string. BUG FIX: this used to only ever touch v[0] - a lowercase letter
@@ -1065,27 +1326,51 @@ function structuralFix(value, lang, mixedCaseWords, customWordsForCasing) {
   // evaluates against the untouched original value); this mirrors that.
   //
   // Once detected, the FIX (mirrors _fix_mixed_case_casing in
-  // core/engine.py) treats the MAJORITY casing among the words actually
-  // eligible to change as this string's real style, and converts only the
-  // minority OUTLIER words to match it - never touching a word that's
-  // already consistent with the majority, an ALL-CAPS acronym (e.g. "LAB"),
-  // or a protected custom-dictionary/glossary term (IDH, Vegam, HCode,
-  // iPAS, DRL, etc.). A tie defaults to sentence case (this rule's
-  // long-standing default direction).
+  // core/engine.py) ALWAYS targets sentence case - a stray capitalized
+  // content word gets lowercased regardless of how many OTHER stray
+  // capitals happen to be in the same string. BUG FIX (2026-09-02, MRG's
+  // real reports): this used to pick the target by MAJORITY VOTE among the
+  // handful of eligible words (capitalized count vs. lowercase count),
+  // which sounds reasonable but isn't - with as few as 3-4 votable words,
+  // just 2 stray capitals were enough to out-vote a single lowercase word
+  // and drag an entire ordinary sentence-case message UP into full Title
+  // Case (e.g. "Failed to load pallet Info" -> "Failed To Load Pallet
+  // Info"), the exact opposite of this project's own stated rule that a
+  // normal UI sentence uses sentence case (see checkEntry's "Sentence is
+  // written in Title Case" detection just above, which independently
+  // confirms an ALL-Title-Case string is itself the problem, never the
+  // goal).
   //
-  // BUG FIX: this used to always assume sentence case was the "correct"
-  // target and blindly lowercase every capitalized content word after the
-  // first - so a string with one genuinely inconsistent word elsewhere
-  // could still wrongly lowercase an unrelated, correctly-capitalized word
-  // (e.g. "Resume" in "...Hold/Resume...") just for being Title Case
-  // somewhere in the same string, or strip a deliberate Title-Case heading
-  // like "LAB Materials Handling Guide" down toward sentence case word by
-  // word. Gated behind the SAME conservative detection above, so a short
-  // intentional Title-Case label like "Please Confirm" never reaches this
-  // code (too few content words, or no actual mix).
+  // A word that's genuinely meant to stay capitalized despite this - an
+  // ALL-CAPS acronym (e.g. "LAB"), a protected custom-dictionary/glossary
+  // term (IDH, Vegam, HCode, iPAS, DRL, etc.), or a slash/hyphen-joined
+  // compound like "Hold/Resume" - is never touched at all, in either
+  // direction: see `isExempt` below and `protectedPhraseSpans`, which is
+  // what actually protects e.g. "Resume" in "...Hold/Resume...",
+  // independent of this block's casing target. A deliberate Title-Case
+  // heading like "LAB Materials Handling Guide" (no lowercase content word
+  // at all once "LAB" is excluded as an acronym) never reaches this code in
+  // the first place - the `capCount > 0 && lowCount > 0` gate above requires
+  // BOTH, same as a short intentional Title-Case label like "Please
+  // Confirm" (too few content words to even qualify).
   if (lang === "en" || lang === "unknown") {
     const MINOR_WORDS = new Set(["of","the","a","an","in","to","and","or","is","are","was","were","by","on","at","as","per","vs","nor","but","for"]);
-    const hasMultipleSentences = /[.!?]\s+[A-Z]/.test(value);
+    // Checked against BOTH the original `value` AND the current,
+    // progressively-fixed `v` - each covers a different way this pipeline
+    // can otherwise get it wrong. `value` alone (the original 2026-08-25
+    // fix, see the note above) preserves a genuine multi-sentence signal
+    // that an EARLIER fix in this same pipeline erased (e.g. the
+    // comma-continuation decap turning "Please" lowercase before this ever
+    // runs). But `value` alone goes wrong the other direction once an
+    // earlier fix instead CREATES a new sentence boundary that didn't exist
+    // in the original - verified directly (MRG's real report, 2026-09-02):
+    // "Formula is locked, Do you want to override it?" has no boundary in
+    // `value` (comma-joined), but the comma-splice-before-question fix above
+    // has already turned it into two real sentences in `v` by this point;
+    // checking `value` alone couldn't see that and wrongly lowercased "Do"
+    // as if it were a stray capitalized word mid one long sentence. Keep in
+    // sync with the same OR in core/engine.py's fix_value.
+    const hasMultipleSentences = /[.!?]\s+[A-Z]/.test(value) || /[.!?]\s+[A-Z]/.test(v);
     const vForCase = value.replace(/\bNo\.\s*/g, "");
     const phraseSpansForCase = protectedPhraseSpans(vForCase);
     const contentMatches = [...vForCase.matchAll(/[A-Za-z']+/g)].filter(m => !MINOR_WORDS.has(m[0].toLowerCase()) && m[0].length > 1);
@@ -1104,7 +1389,23 @@ function structuralFix(value, lang, mixedCaseWords, customWordsForCasing) {
       const lowCount = votable.filter(w => /^[a-z]/.test(w)).length;
       if (capCount > 0 && lowCount > 0) {
         cats.push("Grammar: inconsistent capitalization (mixes Title Case and sentence case)");
-        const targetIsTitle = capCount > lowCount;
+        // ALWAYS sentence case, never a majority-vote toward Title Case.
+        // BUG FIX (verified directly, MRG's real reports, 2026-09-02):
+        // voting let 2 stray capitals out-vote 1 lowercase word among as few
+        // as 3-4 votable words, so ordinary sentence-case error messages
+        // ("Failed to load pallet Info") got dragged INTO full Title Case
+        // ("Failed To Load Pallet Info") whenever just over half their
+        // content words happened to already be capitalized - the exact
+        // opposite of this project's own stated rule that normal UI
+        // sentences use sentence case (see check_entry's "Sentence is
+        // written in Title Case" detection). Sentence case as a fixed
+        // target (not a vote) means a stray capital is always corrected
+        // DOWN, regardless of how many other stray capitals happen to be
+        // in the same string - matches core/engine.py's existing behavior
+        // for a string with NO lowercase content words at all (this just
+        // extends that same "always sentence case" policy to the mixed
+        // case too, instead of only the all-caps-content-words case).
+        const targetIsTitle = false;
         let seenFirstContentWord = false;
         const phraseSpansV = protectedPhraseSpans(v);
         v = v.replace(/[A-Za-z']+/g, (word, offset) => {
@@ -1215,7 +1516,21 @@ async function buildWorkbook(filename, entries, lang) {
   entries.forEach(e => {
     // FIX chain - each step intentionally sees the previous step's output,
     // building the best combined "Suggested Change" text.
-    const { corrected: structFixed, notes: structNotes } = structuralFix(e.value, lang.code, getMixedCaseCustomWords(), customWords);
+    //
+    // Isolated in its own try/catch, same discipline as the spellCheckValue
+    // isolation below: this runs inside entries.forEach, so an exception
+    // here would otherwise propagate out of the WHOLE forEach and abort
+    // every check - Spacing, Grammar, Terminology, AND Spelling (which
+    // depends on structFixed as its input) - for every remaining entry, not
+    // just this one. A structural-fix failure must stay isolated to this
+    // one string, leaving it uncorrected rather than losing the whole report.
+    let structFixed = e.value;
+    let structNotes = [];
+    try {
+      ({ corrected: structFixed, notes: structNotes } = structuralFix(e.value, lang.code, getMixedCaseCustomWords(), customWords));
+    } catch (err) {
+      console.error(`Structural fix failed for "${e.key}" (line ${e.line}) - skipping structural fixes for this string only`, err);
+    }
 
     let spellIssues = [];
     let fullyCorrected = structFixed;
