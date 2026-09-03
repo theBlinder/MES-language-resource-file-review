@@ -102,6 +102,27 @@ runtime
 offline
 online
 
+# --- Bare file-extension words (e.g. "report.csv attached", "export as
+# xlsx") - a general English dictionary has no reason to know these, and
+# unlike the acronyms below (PDF, PNG, JPEG, GIF, ZIP, HTML, XML) which
+# happen to already be recognized as real dictionary words or already listed
+# below, these were getting silently mangled: "csv" -> "cs", "xlsx" -> "xix",
+# "xls" -> "ls", "jpg" -> "jg", "docx" -> "doc", "txt" -> "text", "json" ->
+# "son", "ppt" -> "pt", "pptx" -> "pax". Verified individually against both
+# spelling engines this project uses (hunspell via spylls, typo-js) before
+# adding - only words actually missing from both are listed here;
+# "doc"/"zip"/"pdf"/"png"/"jpeg"/"gif"/"html"/"xml"/"log"/"tiff" were already
+# clean and are NOT duplicated here.
+csv
+xlsx
+xls
+jpg
+docx
+txt
+json
+ppt
+pptx
+
 # --- Common tech/brand terms (from LibreOffice technical.dic) ---
 Accenture
 Acer
